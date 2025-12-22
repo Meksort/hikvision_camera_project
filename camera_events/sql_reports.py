@@ -428,11 +428,25 @@ def generate_comprehensive_attendance_report_sql(
                 ee.entry_time AT TIME ZONE 'Asia/Almaty' as entry_local,
                 ee.exit_time AT TIME ZONE 'Asia/Almaty' as exit_local,
                 -- Вычисляем продолжительность для каждой записи (в секундах)
-                -- Правильно обрабатываем случаи, когда выход на следующий день
-                EXTRACT(EPOCH FROM (
-                    (ee.exit_time AT TIME ZONE 'Asia/Almaty')::timestamp - 
-                    (ee.entry_time AT TIME ZONE 'Asia/Almaty')::timestamp
-                )) as individual_duration_seconds
+                -- ИСПРАВЛЕНО: Добавлена валидация для правильного расчета времени работы
+                -- 1. Проверяем, что выход позже входа (exit_time > entry_time)
+                -- 2. Ограничиваем максимальную продолжительность 48 часами (для защиты от ошибок данных)
+                -- 3. Используем GREATEST для предотвращения отрицательных значений
+                CASE 
+                    WHEN (ee.exit_time AT TIME ZONE 'Asia/Almaty')::timestamp > 
+                         (ee.entry_time AT TIME ZONE 'Asia/Almaty')::timestamp THEN
+                        -- Выход после входа - вычисляем продолжительность
+                        LEAST(
+                            EXTRACT(EPOCH FROM (
+                                (ee.exit_time AT TIME ZONE 'Asia/Almaty')::timestamp - 
+                                (ee.entry_time AT TIME ZONE 'Asia/Almaty')::timestamp
+                            )),
+                            EXTRACT(EPOCH FROM INTERVAL '48 hours')  -- Максимум 48 часов на одну запись
+                        )
+                    ELSE 
+                        -- Некорректные данные (выход раньше или равен входу) - не считаем
+                        0
+                END as individual_duration_seconds
             FROM camera_events_entryexit ee
             INNER JOIN camera_events_employee e ON ee.hikvision_id = e.hikvision_id
             LEFT JOIN camera_events_department d ON e.department_id = d.id
@@ -471,6 +485,22 @@ def generate_comprehensive_attendance_report_sql(
         
         # Основной запрос с агрегацией
         query += """
+        ),
+        -- ИСПРАВЛЕНО: Добавляем выходы следующего дня для круглосуточных графиков
+        -- Это позволяет показывать последний выход следующего дня в строке дня начала смены
+        -- Например: для периода 1 декабря находим все выходы, которые произошли 2 декабря
+        round_the_clock_next_day_exits AS (
+            SELECT 
+                eep.hikvision_id,
+                (DATE(eep.exit_local) - INTERVAL '1 day')::date as previous_period_date,
+                MAX(eep.exit_local) as max_exit_local
+            FROM entry_exits_with_period eep
+            WHERE eep.schedule_type = 'round_the_clock'
+                AND eep.exit_local IS NOT NULL
+                -- Исключаем выходы, которые уже принадлежат текущему периоду (по дате входа)
+                -- Включаем только выходы, которые произошли на следующий календарный день после period_date
+                AND DATE(eep.exit_local) > eep.period_date
+            GROUP BY eep.hikvision_id, (DATE(eep.exit_local) - INTERVAL '1 day')::date
         ),
         -- Предварительно вычисляем среднее время входов для круглосуточных графиков
         round_the_clock_avg_entry AS (
@@ -517,34 +547,49 @@ def generate_comprehensive_attendance_report_sql(
                 eep.schedule_end_time,
                 eep.allowed_late_minutes,
                 eep.allowed_early_leave_minutes,
-                -- Для круглосуточных графиков используем среднее время входов между 7:00 и 12:00
+                -- ИСПРАВЛЕНО: Для круглосуточных графиков используем ПЕРВЫЙ вход из текущего дня
                 -- Для остальных графиков используем MIN
                 CASE 
                     WHEN eep.schedule_type = 'round_the_clock' THEN
-                        COALESCE(rtc.avg_entry_time, (DATE(eep.period_date) + '09:30:00'::time)::timestamp)
+                        -- Используем MIN(entry_local) - первый фактический вход, а не среднее время
+                        MIN(eep.entry_local)
                     ELSE 
                         MIN(eep.entry_local)
                 END as first_entry,
-                MAX(eep.exit_local) as last_exit,
+                -- ИСПРАВЛЕНО: Для круглосуточных графиков включаем выходы из следующего дня
+                -- Это позволяет показывать последний выход следующего дня в строке дня начала смены
+                CASE 
+                    WHEN eep.schedule_type = 'round_the_clock' THEN
+                        GREATEST(
+                            COALESCE(MAX(eep.exit_local), '1970-01-01'::timestamp),
+                            COALESCE(MAX(nd_exits.max_exit_local), '1970-01-01'::timestamp)
+                        )
+                    ELSE 
+                        MAX(eep.exit_local)
+                END as last_exit,
                 -- Рассчитываем продолжительность работы
-                -- НОВАЯ ФОРМУЛА: Для круглосуточных графиков используем ТОЛЬКО ФАКТИЧЕСКОЕ время из базы данных
+                -- ИСПРАВЛЕНО: Для круглосуточных графиков используем ПЕРВЫЙ вход (MIN) и ПОСЛЕДНИЙ выход (MAX)
                 -- ВАЖНО: 
                 -- 1. Считаем ТОЛЬКО если есть фактические записи entry/exit в базе данных
-                -- 2. Используем РЕАЛЬНОЕ время между входом и выходом (без ограничений)
-                -- 3. Если вход 4 декабря 9:00, выход 5 декабря 9:00 - считаем 24 часа
-                -- 4. Если вход 4 декабря 9:00, выход 5 декабря 7:00 - считаем 22 часа (фактическое время)
+                -- 2. Для круглосуточных графиков: используем MIN(entry_local) и MAX(exit_local) для одной непрерывной смены
+                -- 3. Если вход 1 декабря 19:00, выход 2 декабря 20:00 - это ОДНА смена за 1 декабря = 25 часов
+                -- 4. Смена засчитывается за день первого входа (period_date определяется по дате входа)
                 -- 5. Если нет записей в базе - НЕ считаем (0 часов)
                 CASE 
                     WHEN eep.schedule_type = 'round_the_clock' THEN
-                        -- Для круглосуточных графиков: используем ТОЛЬКО фактические записи из базы данных
-                        -- Суммируем все индивидуальные периоды работы
+                        -- ИСПРАВЛЕНО: Для круглосуточных графиков используем ПЕРВЫЙ вход и ПОСЛЕДНИЙ выход
+                        -- Это позволяет правильно обрабатывать смены, которые начинаются в один день и заканчиваются в другой
+                        -- Например: вход 1 декабря 19:00, выход 2 декабря 20:00 = одна смена за 1 декабря (25 часов)
                         -- period_date определяется по дате ВХОДА, поэтому смена засчитывается за день начала
                         CASE 
                             WHEN COUNT(eep.entry_local) > 0 AND COUNT(eep.exit_local) > 0 THEN
-                                -- Есть фактические записи в базе - используем РЕАЛЬНОЕ время работы
-                                -- Суммируем все индивидуальные периоды (entry-exit для каждой записи)
-                                -- НЕ ограничиваем 24 часами - используем фактическое время из базы
-                                COALESCE(SUM(eep.individual_duration_seconds), 0)
+                                -- Есть фактические записи в базе - используем ПЕРВЫЙ вход и ПОСЛЕДНИЙ выход
+                                -- Рассчитываем продолжительность как разницу между первым входом и последним выходом
+                                -- Ограничиваем максимум 72 часами (3 дня) для защиты от ошибок данных
+                                LEAST(
+                                    EXTRACT(EPOCH FROM (MAX(eep.exit_local)::timestamp - MIN(eep.entry_local)::timestamp)),
+                                    EXTRACT(EPOCH FROM INTERVAL '72 hours')
+                                )
                             ELSE
                                 -- Нет фактических записей в базе - НЕ считаем (0 часов)
                                 0
@@ -602,6 +647,10 @@ def generate_comprehensive_attendance_report_sql(
             LEFT JOIN round_the_clock_avg_entry rtc 
                 ON eep.hikvision_id = rtc.hikvision_id 
                 AND eep.period_date = rtc.period_date
+                AND eep.schedule_type = 'round_the_clock'
+            LEFT JOIN round_the_clock_next_day_exits nd_exits
+                ON eep.hikvision_id = nd_exits.hikvision_id 
+                AND eep.period_date = nd_exits.previous_period_date
                 AND eep.schedule_type = 'round_the_clock'
             GROUP BY 
                 eep.hikvision_id, eep.employee_name, eep.department_name, eep.period_date,
