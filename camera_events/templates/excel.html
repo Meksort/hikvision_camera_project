@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Excel Сервис</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #FAF7F2;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container {
+            max-width: 100%;
+            margin: 0 auto;
+            background: rgba(255, 255, 255, 0.9);
+            border-radius: 12px;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
+            padding: 40px;
+        }
+        h1 {
+            color: #5a4a3a;
+            margin-bottom: 30px;
+            text-align: center;
+            font-size: 2.5em;
+            font-weight: 300;
+        }
+        .content {
+            text-align: center;
+            padding: 20px;
+        }
+        .message {
+            font-size: 1.2em;
+            color: #6b5b4a;
+            margin-bottom: 30px;
+        }
+        .features {
+            margin-top: 40px;
+        }
+        .report-links {
+            list-style: none;
+            margin-top: 15px;
+        }
+        .report-links li {
+            margin-bottom: 10px;
+        }
+        .report-link {
+            display: block;
+            padding: 10px 15px;
+            background: rgba(250, 247, 242, 0.8);
+            border: 1px solid rgba(218, 206, 191, 0.6);
+            border-radius: 5px;
+            color: #6b5b4a;
+            text-decoration: none;
+            transition: all 0.3s ease;
+            font-size: 0.95em;
+        }
+        .report-link:hover {
+            background: rgba(218, 206, 191, 0.3);
+            border-color: #7a6a5a;
+            transform: translateX(5px);
+        }
+        .export-form {
+            margin-top: 15px;
+            max-width: 800px;
+            margin-left: auto;
+            margin-right: auto;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        .form-group label {
+            display: block;
+            margin-bottom: 5px;
+            color: #6b5b4a;
+            font-size: 0.9em;
+            font-weight: 600;
+        }
+        .form-group input,
+        .form-group select {
+            width: 100%;
+            padding: 12px 15px;
+            border: 1px solid rgba(218, 206, 191, 0.6);
+            border-radius: 5px;
+            font-size: 1em;
+            color: #5a4a3a;
+            background: rgba(255, 255, 255, 0.9);
+        }
+        .form-group input:focus,
+        .form-group select:focus {
+            outline: none;
+            border-color: #7a6a5a;
+            box-shadow: 0 0 0 2px rgba(122, 106, 90, 0.1);
+        }
+        .btn {
+            width: 100%;
+            padding: 15px;
+            background: #8a7a6a;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            font-size: 1.1em;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.3s ease;
+            margin-top: 20px;
+        }
+        .btn:hover {
+            background: #7a6a5a;
+        }
+        .btn:active {
+            transform: scale(0.98);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Excel Сервис</h1>
+        <div class="content">
+            <div class="message">
+                Добро пожаловать в сервис работы с Excel файлами
+            </div>
+            <div class="features">
+                <div class="export-form">
+                    <div class="form-group">
+                        <label>ФИО сотрудника:</label>
+                        <select id="employeeSelect">
+                            <option value="">-- Выберите сотрудника (необязательно) --</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Подразделение:</label>
+                        <select id="departmentSelect">
+                            <option value="">-- Выберите подразделение (необязательно) --</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Начальная дата:</label>
+                        <input type="date" id="startDate">
+                    </div>
+                    <div class="form-group">
+                        <label>Конечная дата:</label>
+                        <input type="date" id="endDate">
+                    </div>
+                    <button class="btn" onclick="exportData()">📥 Экспортировать статистику посещения в Excel</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Устанавливаем даты по умолчанию (текущий месяц)
+        function setDefaultDates() {
+            const today = new Date();
+            const firstDay = new Date(today.getFullYear(), today.getMonth(), 1);
+            const lastDay = new Date(today.getFullYear(), today.getMonth() + 1, 0);
+            
+            document.getElementById('startDate').value = firstDay.toISOString().split('T')[0];
+            document.getElementById('endDate').value = lastDay.toISOString().split('T')[0];
+        }
+
+        // Загрузка списка сотрудников
+        async function loadEmployees() {
+            try {
+                const response = await fetch('/api/v1/entries-exits/employees-list/');
+                const employees = await response.json();
+                const select = document.getElementById('employeeSelect');
+                
+                employees.forEach(emp => {
+                    const option = document.createElement('option');
+                    option.value = emp.name || '';
+                    option.textContent = `${emp.name || 'Без имени'}${emp.department ? ' - ' + emp.department : ''}${emp.position ? ' (' + emp.position + ')' : ''}`;
+                    option.dataset.hikvisionId = emp.id;
+                    select.appendChild(option);
+                });
+            } catch (error) {
+                console.error('Ошибка при загрузке списка сотрудников:', error);
+            }
+        }
+
+        // Загрузка списка подразделений
+        async function loadDepartments() {
+            try {
+                const response = await fetch('/api/v1/entries-exits/departments-list/');
+                const departments = await response.json();
+                const select = document.getElementById('departmentSelect');
+                
+                departments.forEach(dept => {
+                    const option = document.createElement('option');
+                    option.value = dept.name || '';
+                    option.textContent = dept.name || 'Без названия';
+                    select.appendChild(option);
+                });
+            } catch (error) {
+                console.error('Ошибка при загрузке списка подразделений:', error);
+            }
+        }
+
+        // Функция экспорта данных (всегда статистика посещения - Входы/Выходы)
+        function exportData() {
+            const employeeSelect = document.getElementById('employeeSelect');
+            const departmentSelect = document.getElementById('departmentSelect');
+            const selectedEmployeeOption = employeeSelect.options[employeeSelect.selectedIndex];
+            const employeeName = selectedEmployeeOption.value;
+            const departmentName = departmentSelect.value;
+            const startDate = document.getElementById('startDate').value;
+            const endDate = document.getElementById('endDate').value;
+            
+            if (!startDate || !endDate) {
+                alert('Пожалуйста, выберите начальную и конечную даты');
+                return;
+            }
+            
+            const params = new URLSearchParams({
+                start_date: startDate,
+                end_date: endDate
+            });
+            
+            // Добавляем параметры поиска, если они указаны
+            if (employeeName) {
+                params.append('employee_name', employeeName);
+            }
+            if (departmentName) {
+                params.append('department_name', departmentName);
+            }
+            
+            // Всегда используем статистику посещения (Входы/Выходы)
+            const url = `/api/v1/entries-exits/export-excel/?${params}`;
+            
+            // Открываем ссылку в новом окне для скачивания
+            window.open(url, '_blank');
+        }
+
+        // Инициализация при загрузке страницы
+        window.onload = function() {
+            setDefaultDates();
+            loadEmployees();
+            loadDepartments();
+        };
+    </script>
+</body>
+</html>
+
