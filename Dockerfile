@@ -19,8 +19,15 @@ ENV PATH="/opt/venv/bin:$PATH"
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Copy source code
+# Copy source code (includes docker-entrypoint.sh)
 COPY . .
+
+# Ensure entrypoint script exists and is executable
+RUN if [ ! -f /app/docker-entrypoint.sh ]; then \
+        echo "ERROR: docker-entrypoint.sh not found!" && exit 1; \
+    fi && \
+    chmod +x /app/docker-entrypoint.sh && \
+    ls -la /app/docker-entrypoint.sh
 
 # Collect static files (if needed)
 RUN python manage.py collectstatic --noinput || true
@@ -29,11 +36,13 @@ RUN python manage.py collectstatic --noinput || true
 FROM python:3.11-slim
 
 # Install only runtime dependencies (no build tools)
+# bash is needed for entrypoint script
 RUN apt-get update && apt-get install -y --no-install-recommends \
     postgresql-client \
     libpq5 \
     ca-certificates \
     tzdata \
+    bash \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
@@ -50,8 +59,13 @@ ENV PATH="/opt/venv/bin:$PATH"
 # Copy application code
 COPY --from=builder /app /app
 
-# Copy entrypoint script
+# Copy entrypoint script from builder (already executable there)
 COPY --from=builder /app/docker-entrypoint.sh /docker-entrypoint.sh
+# Ensure it's executable, verify it exists, and check bash is available
+RUN chmod +x /docker-entrypoint.sh && \
+    test -f /docker-entrypoint.sh || (echo "ERROR: Entrypoint script not found!" && exit 1) && \
+    which bash || (echo "ERROR: bash not found!" && exit 1) && \
+    head -1 /docker-entrypoint.sh
 
 # Create nonroot user (UID 65532, same as distroless)
 RUN groupadd -r nonroot && useradd -r -g nonroot -u 65532 nonroot
@@ -59,10 +73,9 @@ RUN groupadd -r nonroot && useradd -r -g nonroot -u 65532 nonroot
 # Set working directory
 WORKDIR /app
 
-# Make sure scripts are executable and set permissions
 # Set ownership for app directory and entrypoint, make venv readable
-RUN chmod +x /docker-entrypoint.sh && \
-    chown -R nonroot:nonroot /app && \
+# Entrypoint should be readable by nonroot (it's in root, but executable by all)
+RUN chown -R nonroot:nonroot /app && \
     chown -R nonroot:nonroot /opt/venv
 
 # Use nonroot user

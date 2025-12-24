@@ -1,5 +1,8 @@
 version: '3.8'
 
+# Optimized multi-stage Dockerfile configuration
+# Code is baked into the image, no volume mounts needed for production
+
 services:
   db:
     image: postgres:15-alpine
@@ -21,11 +24,16 @@ services:
       - hikvision_network
 
   web:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: hikvision_web
+    # Command is handled by Dockerfile CMD, but can be overridden here
+    # For production, consider using gunicorn instead of runserver
     command: python manage.py runserver 0.0.0.0:8000
+    # Remove volume mount for production - code is in image
+    # For development, uncomment: - .:/app
     volumes:
-      - .:/app
       - static_volume:/app/staticfiles
     ports:
       - "8000:8000"
@@ -36,13 +44,16 @@ services:
       - DB_HOST=db
       - DB_PORT=5432
       - SECRET_KEY=${SECRET_KEY:-django-insecure-change-this-in-production}
-      - DEBUG=${DEBUG:-True}
+      - DEBUG=${DEBUG:-False}
       - ALLOWED_HOSTS=${ALLOWED_HOSTS:-*}
+      - TZ=Asia/Almaty
     depends_on:
       db:
         condition: service_healthy
     networks:
       - hikvision_network
+    # Restart policy for production
+    restart: unless-stopped
 
 volumes:
   postgres_data:
