@@ -342,14 +342,9 @@ def generate_comprehensive_attendance_report_python(
             if first_entry is None or last_exit is None:
                 continue
             
-            # Вычисляем продолжительность
+            # Вычисляем продолжительность без искусственных ограничений по максимуму часов
             if last_exit > first_entry:
                 duration_seconds = int((last_exit - first_entry).total_seconds())
-                # Ограничиваем максимум 72 часами для круглосуточных графиков
-                if data['schedule_type'] == 'round_the_clock':
-                    duration_seconds = min(duration_seconds, 72 * 3600)
-                else:
-                    duration_seconds = min(duration_seconds, 16 * 3600)
             else:
                 duration_seconds = 0
             

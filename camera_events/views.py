@@ -37,6 +37,7 @@ from datetime import datetime, timedelta, time, date
 from django.http import HttpResponse, JsonResponse, FileResponse
 from django.utils import timezone
 from django.conf import settings
+from django.db.models import Q
 
 # Попытка использовать zoneinfo (Python 3.9+), иначе используем настройки Django
 try:
@@ -167,21 +168,26 @@ def recalculate_entries_exits(start_date=None, end_date=None):
                         camera_ip = None
                     
                     # Определяем тип события
+                    # ПРИОРИТЕТ: Сначала проверяем IP адрес (самый надежный способ)
                     is_entry = False
                     is_exit = False
                     
                     try:
                         if camera_ip:
                             camera_ip_str = str(camera_ip)
-                            if "192.168.1.143" in camera_ip_str or "143" in camera_ip_str:
+                            # ВЫХОД: IP содержит 143 или 192.168.1.143
+                            if "192.168.1.143" in camera_ip_str or camera_ip_str.endswith(".143") or camera_ip_str == "143":
                                 is_exit = True
-                            elif "192.168.1.124" in camera_ip_str or "124" in camera_ip_str:
+                            # ВХОД: IP содержит 124 или 192.168.1.124
+                            elif "192.168.1.124" in camera_ip_str or camera_ip_str.endswith(".124") or camera_ip_str == "124":
                                 is_entry = True
                         
                         # Если IP не определен, проверяем device_name
                         if not is_entry and not is_exit:
                             device_name_lower = (event.device_name or "").lower()
+                            # ВХОД: проверяем ключевые слова
                             is_entry = any(word in device_name_lower for word in ['вход', 'entry', 'входная', 'вход 1', 'вход1', '124'])
+                            # ВЫХОД: проверяем ключевые слова
                             is_exit = any(word in device_name_lower for word in ['выход', 'exit', 'выходная', 'выход 1', 'выход1', '143'])
                     except Exception as e:
                         logger.warning(f"Ошибка при определении типа события (id={event.id if hasattr(event, 'id') else 'unknown'}): {e}")
@@ -266,26 +272,82 @@ def recalculate_entries_exits(start_date=None, end_date=None):
                         matching_exit_idx = None
                         
                         try:
-                            # Ищем выходы в текущем дне
+                            # УЛУЧШЕННАЯ ЛОГИКА: Если есть вход (IP 124) и выход (IP 143) за один день,
+                            # обязательно находим соответствующий выход
+                            
+                            # Сначала ищем выходы в текущем дне (приоритет - ближайший после входа)
                             for i in range(exit_idx, len(exit_events)):
                                 if exit_events[i].event_time > entry_time:
-                                    matching_exit_event = exit_events[i]
-                                    matching_exit_idx = i
-                                    break
+                                    # Проверяем, что это действительно выход (IP 143 или название содержит "выход")
+                                    exit_event = exit_events[i]
+                                    is_valid_exit = False
+                                    
+                                    # Проверяем IP адрес выхода
+                                    exit_camera_ip = None
+                                    if exit_event.raw_data and isinstance(exit_event.raw_data, dict):
+                                        outer_event = exit_event.raw_data.get("AccessControllerEvent", {})
+                                        if isinstance(outer_event, dict):
+                                            if "AccessControllerEvent" in outer_event:
+                                                inner_event = outer_event["AccessControllerEvent"]
+                                                if isinstance(inner_event, dict):
+                                                    exit_camera_ip = inner_event.get("ipAddress") or inner_event.get("remoteHostAddr") or inner_event.get("ip")
+                                            if not exit_camera_ip:
+                                                exit_camera_ip = outer_event.get("ipAddress") or outer_event.get("remoteHostAddr") or outer_event.get("ip")
+                                        if not exit_camera_ip:
+                                            exit_camera_ip = exit_event.raw_data.get("ipAddress") or exit_event.raw_data.get("remoteHostAddr") or exit_event.raw_data.get("ip")
+                                    
+                                    if exit_camera_ip:
+                                        exit_ip_str = str(exit_camera_ip)
+                                        if "192.168.1.143" in exit_ip_str or exit_ip_str.endswith(".143") or exit_ip_str == "143":
+                                            is_valid_exit = True
+                                    
+                                    # Если IP не определен, проверяем device_name
+                                    if not is_valid_exit:
+                                        exit_device_lower = (exit_event.device_name or "").lower()
+                                        is_valid_exit = any(word in exit_device_lower for word in ['выход', 'exit', 'выходная', 'выход 1', 'выход1', '143'])
+                                    
+                                    # Если это валидный выход, используем его
+                                    if is_valid_exit:
+                                        matching_exit_event = exit_event
+                                        matching_exit_idx = i
+                                        break
                             
                             # Если не нашли в текущем дне, ищем в следующем дне (для ночных смен)
                             if not matching_exit_event and next_day_exit_events:
                                 # Для ночных смен выход должен быть не позже чем через 16 часов после входа
-                                # (например, вход в 22:00, выход до 14:00 следующего дня)
-                                # Увеличено с 12 до 16 часов для учета возможных задержек и длинных смен
                                 max_exit_time = entry_time + timedelta(hours=16)
-                                # Также проверяем, что выход не раньше чем через 4 часа после входа (чтобы исключить случайные совпадения)
-                                min_exit_time = entry_time + timedelta(hours=4)
+                                # Минимум 30 минут после входа (чтобы исключить случайные совпадения, но не слишком строго)
+                                min_exit_time = entry_time + timedelta(minutes=30)
                                 for exit_event in next_day_exit_events:
                                     if exit_event.event_time > entry_time and min_exit_time <= exit_event.event_time <= max_exit_time:
-                                        matching_exit_event = exit_event
-                                        matching_exit_idx = len(exit_events) + next_day_exit_events.index(exit_event)
-                                        break
+                                        # Проверяем, что это действительно выход
+                                        is_valid_exit = False
+                                        exit_camera_ip = None
+                                        if exit_event.raw_data and isinstance(exit_event.raw_data, dict):
+                                            outer_event = exit_event.raw_data.get("AccessControllerEvent", {})
+                                            if isinstance(outer_event, dict):
+                                                if "AccessControllerEvent" in outer_event:
+                                                    inner_event = outer_event["AccessControllerEvent"]
+                                                    if isinstance(inner_event, dict):
+                                                        exit_camera_ip = inner_event.get("ipAddress") or inner_event.get("remoteHostAddr") or inner_event.get("ip")
+                                                if not exit_camera_ip:
+                                                    exit_camera_ip = outer_event.get("ipAddress") or outer_event.get("remoteHostAddr") or outer_event.get("ip")
+                                            if not exit_camera_ip:
+                                                exit_camera_ip = exit_event.raw_data.get("ipAddress") or exit_event.raw_data.get("remoteHostAddr") or exit_event.raw_data.get("ip")
+                                        
+                                        if exit_camera_ip:
+                                            exit_ip_str = str(exit_camera_ip)
+                                            if "192.168.1.143" in exit_ip_str or exit_ip_str.endswith(".143") or exit_ip_str == "143":
+                                                is_valid_exit = True
+                                        
+                                        if not is_valid_exit:
+                                            exit_device_lower = (exit_event.device_name or "").lower()
+                                            is_valid_exit = any(word in exit_device_lower for word in ['выход', 'exit', 'выходная', 'выход 1', 'выход1', '143'])
+                                        
+                                        if is_valid_exit:
+                                            matching_exit_event = exit_event
+                                            matching_exit_idx = len(exit_events) + next_day_exit_events.index(exit_event)
+                                            break
                         except Exception as e:
                             logger.warning(f"Ошибка при поиске соответствующего выхода для сотрудника {hikvision_id}: {e}")
                         
@@ -960,13 +1022,14 @@ class CameraEventViewSet(viewsets.ModelViewSet):
         # Заголовки
         headers = ["Имя", "Подразделение", "Дата", "День недели", "Тип графика", 
                    "Время графика", "Время входа", "Время выхода", "Продолжительность работы", 
-                   "Опоздание", "Ранний уход"]
+                   "Опоздание", "Ранний уход", "Ранний приход", "Поздний выход"]
         ws.append(headers)
         
         # Стили для заголовков
         header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
         header_font = Font(bold=True, color="FFFFFF", size=12)
         red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+        green_fill = PatternFill(start_color="00FF00", end_color="00FF00", fill_type="solid")
         border = Border(
             left=Side(style='thin', color='000000'),
             right=Side(style='thin', color='000000'),
@@ -1070,6 +1133,9 @@ class CameraEventViewSet(viewsets.ModelViewSet):
                     "",
                     "",
                     "",
+                    "",
+                    "",
+                    "",
                 ])
                 
                 # Применяем границы и стили ко всем ячейкам строки
@@ -1100,6 +1166,10 @@ class CameraEventViewSet(viewsets.ModelViewSet):
             first_entry_raw = found_data.get('first_entry')
             last_exit_raw = found_data.get('last_exit')
             total_duration_seconds = found_data.get('total_duration_seconds', 0) or 0
+            late_minutes = found_data.get('late_minutes', 0) or 0
+            early_leave_minutes = found_data.get('early_leave_minutes', 0) or 0
+            early_arrival_minutes = found_data.get('early_arrival_minutes', 0) or 0
+            late_departure_minutes = found_data.get('late_departure_minutes', 0) or 0
             
             # КОРРЕКТИРУЕМ вход и выход согласно графику работы
             # Получаем график для сотрудника
@@ -1196,19 +1266,13 @@ class CameraEventViewSet(viewsets.ModelViewSet):
                             entry_time = first_entry_raw
                             exit_time = last_exit_raw
                         
-                        # Рассчитываем продолжительность
-                        # ИСПРАВЛЕНО: Для круглосуточных графиков используем значение из Python функции
-                        # Python функция использует MIN(entry_local) и MAX(exit_local) для расчета одной непрерывной смены
-                        # Например: вход 1 декабря 19:00, выход 2 декабря 20:00 = одна смена за 1 декабря (25 часов)
-                        if entry_time and exit_time:
-                            # Для обычных графиков пересчитываем продолжительность
+                        # Рассчитываем продолжительность:
+                        # - для круглосуточных графиков полагаемся на значения, рассчитанные SQL/Python-отчетами
+                        #   (MIN(entry_local) и MAX(exit_local) для одной непрерывной смены, без ограничений)
+                        # - для обычных графиков пересчитываем продолжительность по entry/exit для строки
+                        if entry_time and exit_time and schedule_type != 'round_the_clock':
                             corrected_duration = int((exit_time - entry_time).total_seconds())
-                            # Ограничиваем продолжительность разумными пределами (максимум 16 часов)
-                            max_duration = 16 * 3600
-                            if corrected_duration > max_duration:
-                                corrected_duration = max_duration
-                            
-                            # Используем скорректированную продолжительность
+                            # Без искусственного ограничения 16 часами — оставляем фактическую длительность.
                             total_duration_seconds = corrected_duration
                 else:
                     # График не определен для этого дня, используем исходные значения
@@ -1255,7 +1319,11 @@ class CameraEventViewSet(viewsets.ModelViewSet):
                 if isinstance(first_entry, datetime):
                     entry_time_aware = ensure_aware(first_entry)
                     entry_time_local = timezone.localtime(entry_time_aware)
-                    entry_time_str = entry_time_local.strftime("%H:%M:%S")
+                    # Для круглосуточных графиков: вход всегда только время
+                    if schedule_type == 'round_the_clock':
+                        entry_time_str = entry_time_local.strftime("%H:%M:%S")
+                    else:
+                        entry_time_str = entry_time_local.strftime("%H:%M:%S")
                 else:
                     entry_time_str = str(first_entry)
             
@@ -1263,7 +1331,27 @@ class CameraEventViewSet(viewsets.ModelViewSet):
                 if isinstance(last_exit, datetime):
                     exit_time_aware = ensure_aware(last_exit)
                     exit_time_local = timezone.localtime(exit_time_aware)
-                    exit_time_str = exit_time_local.strftime("%H:%M:%S")
+                    # Для круглосуточных графиков: если выход на следующий день, показываем с датой
+                    if schedule_type == 'round_the_clock':
+                        exit_date = exit_time_local.date()
+                        # Определяем дату отчета (дату строки)
+                        if isinstance(report_date, date):
+                            report_date_obj = report_date
+                        elif isinstance(report_date, str):
+                            try:
+                                report_date_obj = datetime.strptime(report_date, "%d/%m/%Y").date()
+                            except:
+                                report_date_obj = exit_date
+                        else:
+                            report_date_obj = exit_date
+                        if exit_date > report_date_obj:
+                            # Выход на следующий день - показываем с полной датой
+                            exit_time_str = exit_time_local.strftime("%Y-%m-%d %H:%M:%S")
+                        else:
+                            # Выход в тот же день - только время
+                            exit_time_str = exit_time_local.strftime("%H:%M:%S")
+                    else:
+                        exit_time_str = exit_time_local.strftime("%H:%M:%S")
                 else:
                     exit_time_str = str(last_exit)
             
@@ -1275,29 +1363,43 @@ class CameraEventViewSet(viewsets.ModelViewSet):
                 duration_str = f"{hours}ч {minutes}м"
                 total_duration_hours += hours + (minutes / 60.0)
             
-            # Рассчитываем опоздание и ранний уход
+            # Форматируем опоздание и ранний уход из SQL-результатов
             late_str = ""
-            early_leave_str = ""
+            if late_minutes and late_minutes > 0:
+                late_hours = int(late_minutes) // 60
+                late_mins = int(late_minutes) % 60
+                if late_hours > 0:
+                    late_str = f"{late_hours}ч {late_mins}м"
+                else:
+                    late_str = f"{late_mins}м"
             
-            if first_entry and last_exit and emp_schedule:
-                from .schedule_matcher import ScheduleMatcher
-                # Создаем временный объект EntryExit для расчета
-                temp_entry_exit = EntryExit(
-                    entry_time=first_entry,
-                    exit_time=last_exit,
-                    hikvision_id=main_employee_id
-                )
-                match_result = ScheduleMatcher.match_entry_exit_to_schedule(temp_entry_exit, emp_schedule)
-                
-                if match_result.get('is_late'):
-                    late_minutes = match_result.get('late_minutes', 0)
-                    if late_minutes > 0:
-                        late_str = f"{late_minutes} мин"
-                
-                if match_result.get('is_early_leave'):
-                    early_minutes = match_result.get('early_leave_minutes', 0)
-                    if early_minutes > 0:
-                        early_leave_str = f"{early_minutes} мин"
+            early_leave_str = ""
+            if early_leave_minutes and early_leave_minutes > 0:
+                early_hours = int(early_leave_minutes) // 60
+                early_mins = int(early_leave_minutes) % 60
+                if early_hours > 0:
+                    early_leave_str = f"{early_hours}ч {early_mins}м"
+                else:
+                    early_leave_str = f"{early_mins}м"
+            
+            # Форматируем ранний приход и поздний выход
+            early_arrival_str = ""
+            if early_arrival_minutes and early_arrival_minutes > 0:
+                early_arr_hours = int(early_arrival_minutes) // 60
+                early_arr_mins = int(early_arrival_minutes) % 60
+                if early_arr_hours > 0:
+                    early_arrival_str = f"{early_arr_hours}ч {early_arr_mins}м"
+                else:
+                    early_arrival_str = f"{early_arr_mins}м"
+            
+            late_departure_str = ""
+            if late_departure_minutes and late_departure_minutes > 0:
+                late_dep_hours = int(late_departure_minutes) // 60
+                late_dep_mins = int(late_departure_minutes) % 60
+                if late_dep_hours > 0:
+                    late_departure_str = f"{late_dep_hours}ч {late_dep_mins}м"
+                else:
+                    late_departure_str = f"{late_dep_mins}м"
             
             ws.append([
                 employee_name,
@@ -1311,6 +1413,8 @@ class CameraEventViewSet(viewsets.ModelViewSet):
                 duration_str,
                 late_str,
                 early_leave_str,
+                early_arrival_str,
+                late_departure_str,
             ])
             
             # Применяем стили
@@ -1318,6 +1422,20 @@ class CameraEventViewSet(viewsets.ModelViewSet):
                 cell = ws.cell(row=row_num, column=col_idx)
                 cell.border = border
                 cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+                
+                # Красный цвет для опозданий, ранних уходов, ранних приходов и поздних выходов
+                if col_idx == 10:  # Колонка K (Опоздание)
+                    if late_str:
+                        cell.fill = red_fill
+                elif col_idx == 11:  # Колонка L (Ранний уход)
+                    if early_leave_str:
+                        cell.fill = red_fill
+                elif col_idx == 12:  # Колонка M (Ранний приход)
+                    if early_arrival_str:
+                        cell.fill = green_fill
+                elif col_idx == 13:  # Колонка N (Поздний выход)
+                    if late_departure_str:
+                        cell.fill = green_fill
             
             row_num += 1
             current_date += timedelta(days=1)
@@ -1325,7 +1443,7 @@ class CameraEventViewSet(viewsets.ModelViewSet):
         # Автоподбор ширины колонок
         column_widths = {
             "A": 25, "B": 30, "C": 12, "D": 12, "E": 18, "F": 20,
-            "G": 15, "H": 15, "I": 20, "J": 15, "K": 15
+            "G": 15, "H": 15, "I": 20, "J": 15, "K": 15, "L": 15, "M": 15, "N": 15
         }
         
         for col_letter, width in column_widths.items():
@@ -1643,6 +1761,124 @@ class EntryExitViewSet(viewsets.ReadOnlyModelViewSet):
         
         return Response(employees_data)
     
+    @action(detail=False, methods=["get"], url_path="check-date")
+    def check_date(self, request):
+        """
+        Проверяет все данные за указанную дату.
+        Показывает CameraEvent и EntryExit записи, помогает найти проблемы.
+        
+        Параметры:
+        - date - дата в формате YYYY-MM-DD (по умолчанию: 2025-12-22)
+        """
+        from collections import defaultdict
+        
+        date_str = request.query_params.get("date", "2025-12-22")
+        
+        try:
+            target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+        except ValueError:
+            return Response({
+                "error": "Неверный формат даты. Используйте YYYY-MM-DD"
+            }, status=400)
+        
+        start_datetime = timezone.make_aware(datetime.combine(target_date, datetime.min.time()))
+        end_datetime = timezone.make_aware(datetime.combine(target_date + timedelta(days=1), datetime.min.time()))
+        
+        result = {
+            "date": date_str,
+            "camera_events": {},
+            "entry_exits": {},
+            "problems": []
+        }
+        
+        # 1. Получаем все CameraEvent
+        camera_events = CameraEvent.objects.filter(
+            event_time__gte=start_datetime,
+            event_time__lt=end_datetime,
+            hikvision_id__isnull=False
+        ).order_by('hikvision_id', 'event_time')
+        
+        events_by_employee = defaultdict(list)
+        for event in camera_events:
+            events_by_employee[event.hikvision_id].append({
+                "id": event.id,
+                "time": timezone.localtime(event.event_time).strftime("%H:%M:%S"),
+                "device_name": event.device_name or "",
+                "raw_data": event.raw_data
+            })
+        
+        for hikvision_id, events in events_by_employee.items():
+            employee = Employee.objects.filter(hikvision_id=hikvision_id).first()
+            employee_name = employee.name if employee else f"ID_{hikvision_id}"
+            result["camera_events"][hikvision_id] = {
+                "employee_name": employee_name,
+                "events_count": len(events),
+                "events": events
+            }
+        
+        # 2. Получаем все EntryExit
+        entry_exits = EntryExit.objects.filter(
+            Q(entry_time__gte=start_datetime, entry_time__lt=end_datetime) |
+            Q(exit_time__gte=start_datetime, exit_time__lt=end_datetime)
+        ).order_by('hikvision_id', 'entry_time')
+        
+        entry_exits_by_employee = defaultdict(list)
+        for entry_exit in entry_exits:
+            entry_exits_by_employee[entry_exit.hikvision_id].append({
+                "id": entry_exit.id,
+                "entry_time": timezone.localtime(entry_exit.entry_time).strftime("%H:%M:%S") if entry_exit.entry_time else None,
+                "exit_time": timezone.localtime(entry_exit.exit_time).strftime("%H:%M:%S") if entry_exit.exit_time else None,
+                "duration": entry_exit.work_duration_formatted if entry_exit.work_duration_seconds else "0ч 0м",
+                "is_complete": bool(entry_exit.entry_time and entry_exit.exit_time)
+            })
+        
+        for hikvision_id, entries in entry_exits_by_employee.items():
+            employee = Employee.objects.filter(hikvision_id=hikvision_id).first()
+            employee_name = employee.name if employee else f"ID_{hikvision_id}"
+            result["entry_exits"][hikvision_id] = {
+                "employee_name": employee_name,
+                "entries_count": len(entries),
+                "entries": entries
+            }
+        
+        # 3. Находим проблемы
+        for hikvision_id in events_by_employee.keys():
+            employee = Employee.objects.filter(hikvision_id=hikvision_id).first()
+            employee_name = employee.name if employee else f"ID_{hikvision_id}"
+            
+            # Проверяем, есть ли полная запись EntryExit
+            full_entry_exit = EntryExit.objects.filter(
+                hikvision_id=hikvision_id,
+                entry_time__gte=start_datetime,
+                entry_time__lt=end_datetime,
+                exit_time__isnull=False
+            ).exists()
+            
+            if not full_entry_exit:
+                events = events_by_employee[hikvision_id]
+                result["problems"].append({
+                    "hikvision_id": hikvision_id,
+                    "employee_name": employee_name,
+                    "events_count": len(events),
+                    "has_partial_entry_exit": EntryExit.objects.filter(
+                        hikvision_id=hikvision_id
+                    ).filter(
+                        Q(entry_time__gte=start_datetime, entry_time__lt=end_datetime) |
+                        Q(exit_time__gte=start_datetime, exit_time__lt=end_datetime)
+                    ).exists(),
+                    "message": "Есть события CameraEvent, но нет полной записи EntryExit (нет выхода)"
+                })
+        
+        result["summary"] = {
+            "total_camera_events": camera_events.count(),
+            "total_entry_exits": entry_exits.count(),
+            "employees_with_events": len(events_by_employee),
+            "employees_with_entry_exits": len(entry_exits_by_employee),
+            "problems_count": len(result["problems"])
+        }
+        
+        return Response(result)
+    
     @action(detail=False, methods=["get"], url_path="departments-list")
     def departments_list(self, request):
         """
@@ -1836,19 +2072,25 @@ class EntryExitViewSet(viewsets.ReadOnlyModelViewSet):
         """
         from datetime import date
         
-        # Заголовки
+        # Русские названия дней недели
+        WEEKDAYS_RU = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота', 'Воскресенье']
+        
+        # Заголовки (новый порядок: ФИО, подразделение, должность, дата, день недели, время графика, тип графика, время входа, время выхода, Продолжительность работы, Опоздание, Ранний уход, Ранний приход, Поздний выход)
         headers = [
-            "Дата",
             "ФИО",
             "Подразделение",
             "Должность",
-            "Тип графика",
+            "Дата",
+            "День недели",
             "Время графика",
+            "Тип графика",
             "Время входа",
             "Время выхода",
             "Продолжительность работы",
-            "Устройство входа",
-            "Устройство выхода"
+            "Опоздание",
+            "Ранний уход",
+            "Ранний приход",
+            "Поздний выход"
         ]
         ws.append(headers)
         
@@ -1856,6 +2098,7 @@ class EntryExitViewSet(viewsets.ReadOnlyModelViewSet):
         header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
         header_font = Font(bold=True, color="FFFFFF", size=12)
         red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+        green_fill = PatternFill(start_color="00FF00", end_color="00FF00", fill_type="solid")
         border = Border(
             left=Side(style='thin', color='000000'),
             right=Side(style='thin', color='000000'),
@@ -1901,18 +2144,86 @@ class EntryExitViewSet(viewsets.ReadOnlyModelViewSet):
         data_by_date = {}
         for result in results:
             report_date = result.get('report_date')
+            date_key = None
+            
+            # Обрабатываем разные форматы даты
             if isinstance(report_date, date):
                 date_key = report_date
+            elif isinstance(report_date, datetime):
+                date_key = report_date.date()
             elif isinstance(report_date, str):
+                # Пробуем разные форматы
+                for fmt in ["%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%d-%m-%Y", "%d.%m.%Y"]:
+                    try:
+                        date_key = datetime.strptime(report_date, fmt).date()
+                        break
+                    except:
+                        continue
+            elif report_date is not None:
+                # Пробуем преобразовать через str
                 try:
-                    date_key = datetime.strptime(report_date, "%Y-%m-%d").date()
+                    date_str = str(report_date)
+                    for fmt in ["%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%d-%m-%Y", "%d.%m.%Y"]:
+                        try:
+                            date_key = datetime.strptime(date_str, fmt).date()
+                            break
+                        except:
+                            continue
                 except:
-                    continue
-            else:
+                    pass
+            
+            if date_key is None:
                 continue
             
+            # Если для этой даты уже есть данные, проверяем, нужно ли обновить
+            # (берем запись с большей продолжительностью или более позднюю)
             if date_key not in data_by_date:
                 data_by_date[date_key] = result
+            else:
+                # Если есть несколько записей для одной даты, берем ту, у которой больше продолжительность
+                existing_duration = data_by_date[date_key].get('total_duration_seconds', 0) or 0
+                new_duration = result.get('total_duration_seconds', 0) or 0
+                if new_duration > existing_duration:
+                    data_by_date[date_key] = result
+        
+        # Для круглосуточных графиков: если выход на следующий день, создаем запись для следующего дня
+        if schedule and schedule.schedule_type == 'round_the_clock':
+            additional_data = {}
+            for date_key, result_data in list(data_by_date.items()):
+                last_exit = result_data.get('last_exit')
+                if last_exit:
+                    # Преобразуем last_exit в дату
+                    exit_date = None
+                    if isinstance(last_exit, datetime):
+                        exit_date = last_exit.date()
+                    elif isinstance(last_exit, str):
+                        try:
+                            exit_date = datetime.strptime(last_exit, "%Y-%m-%d %H:%M:%S").date()
+                        except:
+                            try:
+                                exit_date = datetime.strptime(last_exit, "%Y-%m-%d").date()
+                            except:
+                                pass
+                    elif hasattr(last_exit, 'date'):
+                        exit_date = last_exit.date()
+                    
+                    # Проверяем, что выход на следующий день и входит в диапазон отчета
+                    if exit_date and exit_date > date_key and start_date_obj <= exit_date <= end_date_obj:
+                        # Выход на следующий день - создаем запись для следующего дня
+                        if exit_date not in data_by_date and exit_date not in additional_data:
+                            # Создаем копию результата, но без входа и продолжительности
+                            next_day_result = result_data.copy()
+                            next_day_result['first_entry'] = None
+                            next_day_result['total_duration_seconds'] = 0
+                            next_day_result['report_date'] = exit_date
+                            next_day_result['late_minutes'] = 0
+                            next_day_result['early_leave_minutes'] = 0
+                            next_day_result['early_arrival_minutes'] = 0
+                            next_day_result['late_departure_minutes'] = 0
+                            additional_data[exit_date] = next_day_result
+            
+            # Добавляем дополнительные записи
+            data_by_date.update(additional_data)
         
         # Генерируем все даты в диапазоне
         current_date = start_date_obj
@@ -1922,8 +2233,32 @@ class EntryExitViewSet(viewsets.ReadOnlyModelViewSet):
         
         main_employee_id = clean_id(employee.hikvision_id) if employee.hikvision_id else None
         
+        # Логируем для отладки (можно убрать после проверки)
+        logger.debug(f"Обработка данных для сотрудника {employee_name} (ID: {main_employee_id})")
+        logger.debug(f"Диапазон дат: {start_date_obj} - {end_date_obj}")
+        logger.debug(f"Найдено записей в результатах: {len(results)}")
+        logger.debug(f"Уникальные даты в данных: {sorted(data_by_date.keys())}")
+        
         while current_date <= end_date_obj:
             date_str = current_date.strftime("%d-%m-%Y")
+            weekday_name = WEEKDAYS_RU[current_date.weekday()]
+            
+            # Получаем информацию о графике для этой даты
+            schedule_type_str = ""
+            schedule_time_str = ""
+            if schedule:
+                schedule_type_str = SCHEDULE_TYPE_MAP.get(schedule.schedule_type, "")
+                scheduled_times = ScheduleMatcher.get_scheduled_time_for_date(schedule, current_date)
+                if scheduled_times:
+                    scheduled_start, scheduled_end = scheduled_times
+                    if schedule.schedule_type == 'round_the_clock':
+                        schedule_time_str = "Круглосуточно"
+                    else:
+                        scheduled_start_local = timezone.localtime(scheduled_start)
+                        scheduled_end_local = timezone.localtime(scheduled_end)
+                        start_str = scheduled_start_local.strftime('%H:%M')
+                        end_str = scheduled_end_local.strftime('%H:%M')
+                        schedule_time_str = f"{start_str}-{end_str}"
             
             # Ищем данные для текущей даты
             found_data = data_by_date.get(current_date)
@@ -1933,6 +2268,10 @@ class EntryExitViewSet(viewsets.ReadOnlyModelViewSet):
                 first_entry = found_data.get('first_entry')
                 last_exit = found_data.get('last_exit')
                 total_duration_seconds = found_data.get('total_duration_seconds', 0) or 0
+                late_minutes = found_data.get('late_minutes', 0) or 0
+                early_leave_minutes = found_data.get('early_leave_minutes', 0) or 0
+                early_arrival_minutes = found_data.get('early_arrival_minutes', 0) or 0
+                late_departure_minutes = found_data.get('late_departure_minutes', 0) or 0
                 
                 # Форматируем время входа и выхода
                 entry_time_str = ""
@@ -1948,9 +2287,9 @@ class EntryExitViewSet(viewsets.ReadOnlyModelViewSet):
                             entry_time_local = timezone.localtime(entry_time_aware)
                         else:
                             entry_time_local = timezone.localtime(first_entry)
-                        # Для круглосуточных графиков показываем время + дату (формат ЧЧ:ММ ДД.ММ.ГГГГ)
+                        # Для круглосуточных графиков: вход всегда только время
                         if schedule and schedule.schedule_type == 'round_the_clock':
-                            entry_time_str = entry_time_local.strftime("%H:%M %d.%m.%Y")
+                            entry_time_str = entry_time_local.strftime("%H:%M:%S")
                         else:
                             entry_time_str = entry_time_local.strftime("%H:%M:%S")
                     else:
@@ -1966,9 +2305,15 @@ class EntryExitViewSet(viewsets.ReadOnlyModelViewSet):
                             exit_time_local = timezone.localtime(exit_time_aware)
                         else:
                             exit_time_local = timezone.localtime(last_exit)
-                        # Для круглосуточных графиков показываем время + дату (формат ЧЧ:ММ ДД.ММ.ГГГГ)
+                        # Для круглосуточных графиков: если выход на следующий день, показываем с датой
                         if schedule and schedule.schedule_type == 'round_the_clock':
-                            exit_time_str = exit_time_local.strftime("%H:%M %d.%m.%Y")
+                            exit_date = exit_time_local.date()
+                            if exit_date > current_date:
+                                # Выход на следующий день - показываем с полной датой
+                                exit_time_str = exit_time_local.strftime("%Y-%m-%d %H:%M:%S")
+                            else:
+                                # Выход в тот же день - только время
+                                exit_time_str = exit_time_local.strftime("%H:%M:%S")
                         else:
                             exit_time_str = exit_time_local.strftime("%H:%M:%S")
                     else:
@@ -1981,6 +2326,44 @@ class EntryExitViewSet(viewsets.ReadOnlyModelViewSet):
                 duration_hours_float = duration_hours + (duration_minutes / 60.0)
                 total_duration_hours += duration_hours_float
                 
+                # Форматируем опоздание и ранний уход
+                late_str = ""
+                if late_minutes and late_minutes > 0:
+                    late_hours = int(late_minutes) // 60
+                    late_mins = int(late_minutes) % 60
+                    if late_hours > 0:
+                        late_str = f"{late_hours}ч {late_mins}м"
+                    else:
+                        late_str = f"{late_mins}м"
+                
+                early_leave_str = ""
+                if early_leave_minutes and early_leave_minutes > 0:
+                    early_hours = int(early_leave_minutes) // 60
+                    early_mins = int(early_leave_minutes) % 60
+                    if early_hours > 0:
+                        early_leave_str = f"{early_hours}ч {early_mins}м"
+                    else:
+                        early_leave_str = f"{early_mins}м"
+                
+                # Форматируем ранний приход и поздний выход
+                early_arrival_str = ""
+                if early_arrival_minutes and early_arrival_minutes > 0:
+                    early_arr_hours = int(early_arrival_minutes) // 60
+                    early_arr_mins = int(early_arrival_minutes) % 60
+                    if early_arr_hours > 0:
+                        early_arrival_str = f"{early_arr_hours}ч {early_arr_mins}м"
+                    else:
+                        early_arrival_str = f"{early_arr_mins}м"
+                
+                late_departure_str = ""
+                if late_departure_minutes and late_departure_minutes > 0:
+                    late_dep_hours = int(late_departure_minutes) // 60
+                    late_dep_mins = int(late_departure_minutes) % 60
+                    if late_dep_hours > 0:
+                        late_departure_str = f"{late_dep_hours}ч {late_dep_mins}м"
+                    else:
+                        late_departure_str = f"{late_dep_mins}м"
+                
                 # Суммируем время по графику для этого дня
                 if schedule:
                     scheduled_times = ScheduleMatcher.get_scheduled_time_for_date(schedule, current_date)
@@ -1989,66 +2372,86 @@ class EntryExitViewSet(viewsets.ReadOnlyModelViewSet):
                         scheduled_duration = (scheduled_end - scheduled_start).total_seconds() / 3600.0
                         total_scheduled_hours += scheduled_duration
                 
+                # Новый порядок колонок: ФИО, подразделение, должность, дата, день недели, время графика, тип графика, время входа, время выхода, Продолжительность работы, Опоздание, Ранний уход, Ранний приход, Поздний выход
                 ws.append([
-                    date_str,
                     employee_name,
                     department_name,
                     position,
-                    "",  # Тип графика (для обычных строк пусто)
-                    "",  # Время графика (для обычных строк пусто)
+                    date_str,
+                    weekday_name,
+                    schedule_time_str,
+                    schedule_type_str,
                     entry_time_str,
                     exit_time_str,
                     duration_str,
-                    "",  # Устройство входа
-                    "",  # Устройство выхода
+                    late_str,
+                    early_leave_str,
+                    early_arrival_str,
+                    late_departure_str,
                 ])
                 
-                # Применяем стили
-                for col_idx, col_letter in enumerate(['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K'], 1):
+                # Применяем стили (новый порядок колонок: A-N)
+                for col_idx, col_letter in enumerate(['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N'], 1):
                     cell = ws.cell(row=row_num, column=col_idx)
                     cell.border = border
                     cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
                     
                     # Красный цвет для пустых ячеек времени входа/выхода и при малой продолжительности
-                    if col_letter == 'G':  # Время входа
+                    if col_letter == 'H':  # Время входа (колонка H)
                         if not entry_time_str or (duration_hours_float > 0 and duration_hours_float < 2.0):
                             cell.fill = red_fill
-                    elif col_letter == 'H':  # Время выхода
+                    elif col_letter == 'I':  # Время выхода (колонка I)
                         if not exit_time_str or (duration_hours_float > 0 and duration_hours_float < 2.0):
                             cell.fill = red_fill
-                    elif col_letter == 'I':  # Продолжительность работы
+                    elif col_letter == 'J':  # Продолжительность работы (колонка J)
                         if duration_hours_float > 0 and duration_hours_float < 2.0:
                             cell.fill = red_fill
                         elif not duration_str:
                             cell.fill = red_fill
+                    elif col_letter == 'K':  # Опоздание (колонка K)
+                        if late_str:  # Если есть опоздание - красный цвет
+                            cell.fill = red_fill
+                    elif col_letter == 'L':  # Ранний уход (колонка L)
+                        if early_leave_str:  # Если есть ранний уход - красный цвет
+                            cell.fill = red_fill
+                    elif col_letter == 'M':  # Ранний приход (колонка M)
+                        if early_arrival_str:  # Если есть ранний приход - зеленый цвет
+                            cell.fill = green_fill
+                    elif col_letter == 'N':  # Поздний выход (колонка N)
+                        if late_departure_str:  # Если есть поздний выход - зеленый цвет
+                            cell.fill = green_fill
             else:
                 # Нет данных для этой даты - создаем пустую строку с красным
+                # Новый порядок колонок: ФИО, подразделение, должность, дата, день недели, время графика, тип графика, время входа, время выхода, Продолжительность работы, Опоздание, Ранний уход, Ранний приход, Поздний выход
                 ws.append([
-                    date_str,
                     employee_name,
                     department_name,
                     position,
-                    "",  # Тип графика
-                    "",  # Время графика
+                    date_str,
+                    weekday_name,
+                    schedule_time_str,
+                    schedule_type_str,
                     "",  # Время входа - пустое, будет красным
                     "",  # Время выхода - пустое, будет красным
-                    "",
-                    "",
-                    "",
+                    "",  # Продолжительность - пустая, будет красной
+                    "",  # Опоздание - пустое
+                    "",  # Ранний уход - пустое
+                    "",  # Ранний приход - пустое
+                    "",  # Поздний выход - пустое
                 ])
                 
-                # Применяем стили и красный цвет для пустых ячеек
-                for col_idx, col_letter in enumerate(['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K'], 1):
+                # Применяем стили и красный цвет для пустых ячеек (новый порядок колонок: A-N)
+                for col_idx, col_letter in enumerate(['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N'], 1):
                     cell = ws.cell(row=row_num, column=col_idx)
                     cell.border = border
                     cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
                     
                     # Красный цвет для пустых ячеек времени входа/выхода и продолжительности
-                    if col_letter == 'G':  # Время входа - всегда красное
+                    if col_letter == 'H':  # Время входа - всегда красное
                         cell.fill = red_fill
-                    elif col_letter == 'H':  # Время выхода - всегда красное
+                    elif col_letter == 'I':  # Время выхода - всегда красное
                         cell.fill = red_fill
-                    elif col_letter == 'I':  # Продолжительность - всегда красная для пустых строк
+                    elif col_letter == 'J':  # Продолжительность - всегда красная для пустых строк
                         cell.fill = red_fill
                 
                 # Для пустых дней также проверяем график
@@ -2157,7 +2560,7 @@ class EntryExitViewSet(viewsets.ReadOnlyModelViewSet):
         if scheduled_duration_str:
             schedule_type_value = f"должен отработать: {scheduled_duration_str}"
         
-        # Добавляем итоговую строку
+        # Добавляем итоговую строку (новый порядок колонок: ФИО, подразделение, должность, дата, день недели, время графика, тип графика, время входа, время выхода, Продолжительность работы)
         total_fill = PatternFill(start_color="D3D3D3", end_color="D3D3D3", fill_type="solid")
         total_font = Font(bold=True, size=12)
         
@@ -2166,13 +2569,12 @@ class EntryExitViewSet(viewsets.ReadOnlyModelViewSet):
             "",
             "",
             "",
-            schedule_type_value,
+            "",
             schedule_time_display if schedule_time_display else "",
+            schedule_type_value,
             "",
             "",
             total_duration_str,
-            "",
-            "",
         ])
         
         total_row = ws.max_row
@@ -2183,10 +2585,18 @@ class EntryExitViewSet(viewsets.ReadOnlyModelViewSet):
             cell.border = border
             cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
         
-        # Автоподбор ширины колонок
+        # Автоподбор ширины колонок (новый порядок: ФИО, подразделение, должность, дата, день недели, время графика, тип графика, время входа, время выхода, Продолжительность работы)
         column_widths = {
-            "A": 15, "B": 30, "C": 35, "D": 20, "E": 25, "F": 20,
-            "G": 20, "H": 20, "I": 25, "J": 20, "K": 20
+            "A": 30,  # ФИО
+            "B": 35,  # Подразделение
+            "C": 20,  # Должность
+            "D": 15,  # Дата
+            "E": 15,  # День недели
+            "F": 20,  # Время графика
+            "G": 25,  # Тип графика
+            "H": 20,  # Время входа
+            "I": 20,  # Время выхода
+            "J": 25   # Продолжительность работы
         }
         
         for col_letter, width in column_widths.items():
@@ -2605,7 +3015,11 @@ class AttendanceStatsViewSet(viewsets.ReadOnlyModelViewSet):
                             entry_time_local = timezone.localtime(entry_time_aware)
                         else:
                             entry_time_local = timezone.localtime(first_entry)
-                        entry_time_str = entry_time_local.strftime("%H:%M:%S")
+                        # Для круглосуточных графиков: вход всегда только время
+                        if schedule and schedule.schedule_type == 'round_the_clock':
+                            entry_time_str = entry_time_local.strftime("%H:%M:%S")
+                        else:
+                            entry_time_str = entry_time_local.strftime("%H:%M:%S")
                     else:
                         entry_time_str = str(first_entry)
                 
@@ -2622,7 +3036,17 @@ class AttendanceStatsViewSet(viewsets.ReadOnlyModelViewSet):
                             exit_time_local = timezone.localtime(exit_time_aware)
                         else:
                             exit_time_local = timezone.localtime(last_exit)
-                        exit_time_str = exit_time_local.strftime("%H:%M:%S")
+                        # Для круглосуточных графиков: если выход на следующий день, показываем с датой
+                        if schedule and schedule.schedule_type == 'round_the_clock':
+                            exit_date = exit_time_local.date()
+                            if exit_date > current_date:
+                                # Выход на следующий день - показываем с полной датой
+                                exit_time_str = exit_time_local.strftime("%Y-%m-%d %H:%M:%S")
+                            else:
+                                # Выход в тот же день - только время
+                                exit_time_str = exit_time_local.strftime("%H:%M:%S")
+                        else:
+                            exit_time_str = exit_time_local.strftime("%H:%M:%S")
                     else:
                         exit_time_str = str(last_exit)
                 

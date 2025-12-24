@@ -61,17 +61,22 @@ def process_single_camera_event(camera_event):
             logger.warning(f"Ошибка при извлечении IP из события {camera_event.id}: {e}")
         
         # Определяем тип события
+        # ПРИОРИТЕТ: Сначала проверяем IP адрес (самый надежный способ)
         if camera_ip:
             camera_ip_str = str(camera_ip)
-            if "192.168.1.143" in camera_ip_str or "143" in camera_ip_str:
+            # ВЫХОД: IP содержит 143 или 192.168.1.143
+            if "192.168.1.143" in camera_ip_str or camera_ip_str.endswith(".143") or camera_ip_str == "143":
                 is_exit = True
-            elif "192.168.1.124" in camera_ip_str or "124" in camera_ip_str:
+            # ВХОД: IP содержит 124 или 192.168.1.124
+            elif "192.168.1.124" in camera_ip_str or camera_ip_str.endswith(".124") or camera_ip_str == "124":
                 is_entry = True
         
         # Если IP не определен, проверяем device_name
         if not is_entry and not is_exit:
             device_name_lower = (camera_event.device_name or "").lower()
+            # ВХОД: проверяем ключевые слова
             is_entry = any(word in device_name_lower for word in ['вход', 'entry', 'входная', 'вход 1', 'вход1', '124'])
+            # ВЫХОД: проверяем ключевые слова
             is_exit = any(word in device_name_lower for word in ['выход', 'exit', 'выходная', 'выход 1', 'выход1', '143'])
         
         if not (is_entry or is_exit):
@@ -129,17 +134,21 @@ def process_single_camera_event(camera_event):
                 ).order_by('-entry_time').first()
             
             if existing:
-                # Проверяем, что выход не раньше входа и не позже чем через 16 часов
+                # УЛУЧШЕННАЯ ЛОГИКА: Если есть вход (IP 124) и выход (IP 143), обязательно создаем полную запись
+                # Проверяем, что выход не раньше входа
                 if event_time > existing.entry_time:
                     duration = event_time - existing.entry_time
-                    # Проверяем разумность продолжительности (от 4 до 16 часов)
                     hours_diff = duration.total_seconds() / 3600
-                    if 4 <= hours_diff <= 16:
+                    # УВЕЛИЧЕН диапазон: от 30 минут до 24 часов (для учета длинных смен и ночных смен)
+                    # Это гарантирует, что если есть вход (IP 124) и выход (IP 143), они будут сопоставлены
+                    if 0.5 <= hours_diff <= 24:
                         existing.exit_time = event_time
                         existing.device_name_exit = camera_event.device_name
                         existing.work_duration_seconds = int(duration.total_seconds())
                         existing.save()
-                        logger.info(f"Обновлена запись EntryExit (выход) для сотрудника {clean_employee_id} на {existing.entry_time.date()}")
+                        logger.info(f"Обновлена запись EntryExit (выход) для сотрудника {clean_employee_id} на {existing.entry_time.date()}, продолжительность: {hours_diff:.2f} часов")
+                    else:
+                        logger.warning(f"Выход для сотрудника {clean_employee_id} отклонен: продолжительность {hours_diff:.2f} часов вне допустимого диапазона (0.5-24 часа)")
             else:
                 # Если нет записи входа, создаем запись только с выходом (неполная запись)
                 EntryExit.objects.create(
