@@ -934,8 +934,8 @@ class CameraEventViewSet(viewsets.ModelViewSet):
     
     def _export_excel_sql(self, hikvision_id, device_name, start_date, end_date):
         """
-        Полная SQL версия экспорта отчетов для CameraEventViewSet.
-        Использует оптимизированные SQL запросы вместо ORM.
+        Экспорт отчетов (один лист) с использованием
+        SQL-функции generate_comprehensive_attendance_report_sql.
         """
         from .sql_reports import generate_comprehensive_attendance_report_sql
         from .utils import get_excluded_hikvision_ids
@@ -943,7 +943,7 @@ class CameraEventViewSet(viewsets.ModelViewSet):
         # Получаем исключаемые ID
         excluded_hikvision_ids = get_excluded_hikvision_ids()
         
-        # Получаем данные через SQL запрос
+        # Получаем данные через SQL функцию
         results, start_date_obj, end_date_obj = generate_comprehensive_attendance_report_sql(
             hikvision_id=hikvision_id,
             start_date=start_date,
@@ -1109,7 +1109,13 @@ class CameraEventViewSet(viewsets.ModelViewSet):
             exit_time = None
             corrected_duration = 0
             
-            if emp_schedule and current_date:
+            # ВАЖНО: для круглосуточных графиков ИСПОЛЬЗУЕМ значения,
+            # уже рассчитанные в SQL (first_entry_raw / last_exit_raw),
+            # чтобы сохранить логику окна 07:00–11:00 и правильного выхода.
+            if schedule_type == 'round_the_clock':
+                entry_time = first_entry_raw
+                exit_time = last_exit_raw
+            elif emp_schedule and current_date:
                 # Получаем запланированное время работы по графику
                 from .schedule_matcher import ScheduleMatcher
                 scheduled_times = ScheduleMatcher.get_scheduled_time_for_date(emp_schedule, current_date)
@@ -1191,15 +1197,10 @@ class CameraEventViewSet(viewsets.ModelViewSet):
                             exit_time = last_exit_raw
                         
                         # Рассчитываем продолжительность
-                        # ИСПРАВЛЕНО: Для круглосуточных графиков используем значение из SQL
-                        # SQL использует MIN(entry_local) и MAX(exit_local) для расчета одной непрерывной смены
+                        # ИСПРАВЛЕНО: Для круглосуточных графиков используем значение из Python функции
+                        # Python функция использует MIN(entry_local) и MAX(exit_local) для расчета одной непрерывной смены
                         # Например: вход 1 декабря 19:00, выход 2 декабря 20:00 = одна смена за 1 декабря (25 часов)
-                        if schedule_type == 'round_the_clock':
-                            # Для круглосуточных графиков используем значение из SQL запроса
-                            # SQL уже вычисляет продолжительность как MAX(exit) - MIN(entry) для одного непрерывного периода
-                            # Не пересчитываем, используем значение из SQL
-                            pass  # total_duration_seconds уже установлен из SQL как MAX(exit) - MIN(entry)
-                        elif entry_time and exit_time:
+                        if entry_time and exit_time:
                             # Для обычных графиков пересчитываем продолжительность
                             corrected_duration = int((exit_time - entry_time).total_seconds())
                             # Ограничиваем продолжительность разумными пределами (максимум 16 часов)
@@ -1691,9 +1692,9 @@ class EntryExitViewSet(viewsets.ReadOnlyModelViewSet):
         end_date_str = request.query_params.get("end_date")
         
         # ВСЕГДА используем оптимизированные SQL запросы
-        return self._export_excel_sql(hikvision_id, employee_name, department_name, start_date_str, end_date_str)
+        return self._export_excel_sql_by_department(hikvision_id, employee_name, department_name, start_date_str, end_date_str)
     
-    def _export_excel_sql(self, hikvision_id, employee_name, department_name, start_date_str, end_date_str):
+    def _export_excel_sql_by_department(self, hikvision_id, employee_name, department_name, start_date_str, end_date_str):
         """
         Оптимизированная версия экспорта с использованием SQL запросов.
         Использует только SQL запросы из sql_reports.py, без ORM.
@@ -1937,81 +1938,41 @@ class EntryExitViewSet(viewsets.ReadOnlyModelViewSet):
                 entry_time_str = ""
                 exit_time_str = ""
                 
-                # Для круглосуточных графиков используем специальную логику
-                if schedule and schedule.schedule_type == 'round_the_clock':
-                    # Для круглосуточных графиков: вход = среднее время входов между 7:00 и 12:00
-                    # (вычисляется в SQL запросе), выход = то же время, но на следующий день
-                    if first_entry:
-                        if isinstance(first_entry, datetime):
-                            # Используем среднее время входа из SQL (уже вычислено для промежутка 7:00-12:00)
-                            if timezone.is_naive(first_entry):
-                                if ALMATY_TZ:
-                                    entry_time_aware = first_entry.replace(tzinfo=ALMATY_TZ)
-                                else:
-                                    entry_time_aware = timezone.make_aware(first_entry)
-                                entry_time_local = timezone.localtime(entry_time_aware)
+                if first_entry:
+                    if isinstance(first_entry, datetime):
+                        if timezone.is_naive(first_entry):
+                            if ALMATY_TZ:
+                                entry_time_aware = first_entry.replace(tzinfo=ALMATY_TZ)
                             else:
-                                entry_time_local = timezone.localtime(first_entry)
-                            
-                            # Выход - то же время, но на следующий день
-                            exit_time_obj = datetime.combine(
-                                entry_time_local.date() + timedelta(days=1),
-                                entry_time_local.time()
-                            )
-                            exit_time_aware = timezone.make_aware(exit_time_obj)
-                            exit_time_local = timezone.localtime(exit_time_aware)
-                            
-                            entry_time_str = entry_time_local.strftime("%H:%M:%S")
-                            exit_time_str = exit_time_local.strftime("%H:%M:%S")
-                        else:
-                            # Если first_entry не datetime, используем среднее время 9:30
-                            entry_time_obj = datetime.combine(current_date, time(9, 30))
-                            exit_time_obj = datetime.combine(current_date + timedelta(days=1), time(9, 30))
-                            entry_time_aware = timezone.make_aware(entry_time_obj)
-                            exit_time_aware = timezone.make_aware(exit_time_obj)
+                                entry_time_aware = timezone.make_aware(first_entry)
                             entry_time_local = timezone.localtime(entry_time_aware)
-                            exit_time_local = timezone.localtime(exit_time_aware)
+                        else:
+                            entry_time_local = timezone.localtime(first_entry)
+                        # Для круглосуточных графиков показываем время + дату (формат ЧЧ:ММ ДД.ММ.ГГГГ)
+                        if schedule and schedule.schedule_type == 'round_the_clock':
+                            entry_time_str = entry_time_local.strftime("%H:%M %d.%m.%Y")
+                        else:
                             entry_time_str = entry_time_local.strftime("%H:%M:%S")
+                    else:
+                        entry_time_str = str(first_entry)
+                
+                if last_exit:
+                    if isinstance(last_exit, datetime):
+                        if timezone.is_naive(last_exit):
+                            if ALMATY_TZ:
+                                exit_time_aware = last_exit.replace(tzinfo=ALMATY_TZ)
+                            else:
+                                exit_time_aware = timezone.make_aware(last_exit)
+                            exit_time_local = timezone.localtime(exit_time_aware)
+                        else:
+                            exit_time_local = timezone.localtime(last_exit)
+                        # Для круглосуточных графиков показываем время + дату (формат ЧЧ:ММ ДД.ММ.ГГГГ)
+                        if schedule and schedule.schedule_type == 'round_the_clock':
+                            exit_time_str = exit_time_local.strftime("%H:%M %d.%m.%Y")
+                        else:
                             exit_time_str = exit_time_local.strftime("%H:%M:%S")
                     else:
-                        # Если нет данных о входе, используем среднее время 9:30
-                        entry_time_obj = datetime.combine(current_date, time(9, 30))
-                        exit_time_obj = datetime.combine(current_date + timedelta(days=1), time(9, 30))
-                        entry_time_aware = timezone.make_aware(entry_time_obj)
-                        exit_time_aware = timezone.make_aware(exit_time_obj)
-                        entry_time_local = timezone.localtime(entry_time_aware)
-                        exit_time_local = timezone.localtime(exit_time_aware)
-                        entry_time_str = entry_time_local.strftime("%H:%M:%S")
-                        exit_time_str = exit_time_local.strftime("%H:%M:%S")
-                else:
-                    # Для обычных графиков используем фактические времена входа/выхода
-                    if first_entry:
-                        if isinstance(first_entry, datetime):
-                            if timezone.is_naive(first_entry):
-                                if ALMATY_TZ:
-                                    entry_time_aware = first_entry.replace(tzinfo=ALMATY_TZ)
-                                else:
-                                    entry_time_aware = timezone.make_aware(first_entry)
-                                entry_time_local = timezone.localtime(entry_time_aware)
-                            else:
-                                entry_time_local = timezone.localtime(first_entry)
-                            entry_time_str = entry_time_local.strftime("%H:%M:%S")
-                        else:
-                            entry_time_str = str(first_entry)
-                    
-                    if last_exit:
-                        if isinstance(last_exit, datetime):
-                            if timezone.is_naive(last_exit):
-                                if ALMATY_TZ:
-                                    exit_time_aware = last_exit.replace(tzinfo=ALMATY_TZ)
-                                else:
-                                    exit_time_aware = timezone.make_aware(last_exit)
-                                exit_time_local = timezone.localtime(exit_time_aware)
-                            else:
-                                exit_time_local = timezone.localtime(last_exit)
-                            exit_time_str = exit_time_local.strftime("%H:%M:%S")
-                        else:
-                            exit_time_str = str(last_exit)
+                        exit_time_str = str(last_exit)
                 
                 # Продолжительность
                 duration_hours = int(total_duration_seconds) // 3600
