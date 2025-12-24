@@ -23,11 +23,20 @@ RUN pip install --no-cache-dir --upgrade pip && \
 COPY . .
 
 # Ensure entrypoint script exists and is executable
-RUN if [ ! -f /app/docker-entrypoint.sh ]; then \
-        echo "ERROR: docker-entrypoint.sh not found!" && exit 1; \
+# List all files to debug
+RUN echo "=== Files in /app ===" && \
+    ls -la /app/ | head -20 && \
+    echo "=== Looking for docker-entrypoint.sh ===" && \
+    find /app -name "docker-entrypoint.sh" -type f && \
+    if [ ! -f /app/docker-entrypoint.sh ]; then \
+        echo "ERROR: docker-entrypoint.sh not found in /app!" && \
+        echo "Files in /app:" && \
+        ls -la /app/ && \
+        exit 1; \
     fi && \
     chmod +x /app/docker-entrypoint.sh && \
-    ls -la /app/docker-entrypoint.sh
+    ls -la /app/docker-entrypoint.sh && \
+    echo "=== Entrypoint file verified in builder ==="
 
 # Collect static files (if needed)
 RUN python manage.py collectstatic --noinput || true
@@ -59,13 +68,17 @@ ENV PATH="/opt/venv/bin:$PATH"
 # Copy application code
 COPY --from=builder /app /app
 
-# Copy entrypoint script from builder (already executable there)
-COPY --from=builder /app/docker-entrypoint.sh /docker-entrypoint.sh
-# Ensure it's executable, verify it exists, and check bash is available
-RUN chmod +x /docker-entrypoint.sh && \
-    test -f /docker-entrypoint.sh || (echo "ERROR: Entrypoint script not found!" && exit 1) && \
-    which bash || (echo "ERROR: bash not found!" && exit 1) && \
-    head -1 /docker-entrypoint.sh
+# Copy entrypoint script from builder (we verified it exists there)
+RUN cp /app/docker-entrypoint.sh /docker-entrypoint.sh && \
+    chmod +x /docker-entrypoint.sh && \
+    ls -la /docker-entrypoint.sh && \
+    test -f /docker-entrypoint.sh && \
+    echo "=== Entrypoint file copied and verified ===" && \
+    head -1 /docker-entrypoint.sh && \
+    which bash && \
+    echo "=== Bash location ===" && \
+    ls -la /bin/bash && \
+    echo "Entrypoint script verified successfully"
 
 # Create nonroot user (UID 65532, same as distroless)
 RUN groupadd -r nonroot && useradd -r -g nonroot -u 65532 nonroot
@@ -78,8 +91,45 @@ WORKDIR /app
 RUN chown -R nonroot:nonroot /app && \
     chown -R nonroot:nonroot /opt/venv
 
+# Create a wrapper script that verifies entrypoint exists (before user switch)
+RUN echo '#!/bin/bash' > /entrypoint-wrapper.sh && \
+    echo 'if [ ! -f /docker-entrypoint.sh ]; then' >> /entrypoint-wrapper.sh && \
+    echo '  echo "ERROR: Entrypoint file not found at /docker-entrypoint.sh"' >> /entrypoint-wrapper.sh && \
+    echo '  echo "Files in /:"' >> /entrypoint-wrapper.sh && \
+    echo '  ls -la /' >> /entrypoint-wrapper.sh && \
+    echo '  echo "Files in /app:"' >> /entrypoint-wrapper.sh && \
+    echo '  ls -la /app/ | head -10' >> /entrypoint-wrapper.sh && \
+    echo '  exit 1' >> /entrypoint-wrapper.sh && \
+    echo 'fi' >> /entrypoint-wrapper.sh && \
+    echo 'exec /bin/bash /docker-entrypoint.sh "$@"' >> /entrypoint-wrapper.sh && \
+    chmod +x /entrypoint-wrapper.sh && \
+    echo "=== Wrapper script created ===" && \
+    cat /entrypoint-wrapper.sh
+
+# Final verification before switching user - ensure entrypoint exists and is accessible
+# Also verify bash location
+RUN test -f /docker-entrypoint.sh && \
+    test -x /docker-entrypoint.sh && \
+    test -f /entrypoint-wrapper.sh && \
+    test -x /entrypoint-wrapper.sh && \
+    file /docker-entrypoint.sh && \
+    cat /docker-entrypoint.sh | head -1 && \
+    which bash && \
+    ls -la /bin/bash /usr/bin/bash 2>/dev/null || echo "Checking bash location..." && \
+    echo "=== Final check: Entrypoint file ===" && \
+    ls -la /docker-entrypoint.sh && \
+    echo "=== File content (first line) ===" && \
+    head -1 /docker-entrypoint.sh
+
 # Use nonroot user
 USER nonroot:nonroot
+
+# Verify file is still accessible after user switch (as nonroot)
+RUN test -f /docker-entrypoint.sh && \
+    test -r /docker-entrypoint.sh && \
+    test -f /entrypoint-wrapper.sh && \
+    echo "Entrypoint file is accessible as nonroot user" || \
+    (echo "WARNING: Entrypoint file may not be accessible" && ls -la /docker-entrypoint.sh /entrypoint-wrapper.sh)
 
 # Environment variables
 ENV PYTHONUNBUFFERED=1 \
@@ -88,8 +138,8 @@ ENV PYTHONUNBUFFERED=1 \
 # Expose port
 EXPOSE 8000
 
-# Entrypoint
-ENTRYPOINT ["/docker-entrypoint.sh"]
+# Entrypoint - use wrapper script (created above)
+ENTRYPOINT ["/entrypoint-wrapper.sh"]
 
 # Default command
 CMD ["python", "manage.py", "runserver", "0.0.0.0:8000"]
