@@ -69,7 +69,11 @@ ENV PATH="/opt/venv/bin:$PATH"
 COPY --from=builder /app /app
 
 # Copy entrypoint script from builder (we verified it exists there)
+# Convert Windows line endings (CRLF) to Unix (LF) and make executable
 RUN cp /app/docker-entrypoint.sh /docker-entrypoint.sh && \
+    # Remove Windows line endings (CRLF -> LF) - simple and reliable
+    tr -d '\r' < /docker-entrypoint.sh > /docker-entrypoint.sh.tmp && \
+    mv /docker-entrypoint.sh.tmp /docker-entrypoint.sh && \
     chmod +x /docker-entrypoint.sh && \
     ls -la /docker-entrypoint.sh && \
     test -f /docker-entrypoint.sh && \
