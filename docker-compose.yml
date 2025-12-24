@@ -4,24 +4,26 @@ version: '3.8'
 # Code is baked into the image, no volume mounts needed for production
 
 services:
-  db:
-    image: postgres:15-alpine
-    container_name: hikvision_db
-    environment:
-      POSTGRES_DB: ${DB_NAME:-hikvision_db}
-      POSTGRES_USER: ${DB_USER:-postgres}
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    networks:
-      - hikvision_network
+  # PostgreSQL container - можно отключить, если используете локальную БД
+  # Раскомментируйте, если нужна БД в Docker
+  # db:
+  #   image: postgres:15-alpine
+  #   container_name: hikvision_db
+  #   environment:
+  #     POSTGRES_DB: ${DB_NAME:-hikvision_db}
+  #     POSTGRES_USER: ${DB_USER:-postgres}
+  #     POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+  #   volumes:
+  #     - postgres_data:/var/lib/postgresql/data
+  #   ports:
+  #     - "5432:5432"
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres}"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+  #   networks:
+  #     - hikvision_network
 
   web:
     build:
@@ -36,20 +38,26 @@ services:
     volumes:
       - static_volume:/app/staticfiles
     ports:
-      - "8000:8000"
+      - "0.0.0.0:8000:8000"  # Bind to all interfaces for network access
     environment:
       - DB_NAME=${DB_NAME:-hikvision_db}
       - DB_USER=${DB_USER:-postgres}
       - DB_PASSWORD=${DB_PASSWORD:-postgres}
-      - DB_HOST=db
-      - DB_PORT=5432
+      # Use 'host.docker.internal' to connect to local PostgreSQL on Windows/Mac
+      # Use '172.17.0.1' or your host IP on Linux
+      # Use 'db' to use Docker PostgreSQL container
+      - DB_HOST=${DB_HOST:-host.docker.internal}
+      - DB_PORT=${DB_PORT:-5432}
       - SECRET_KEY=${SECRET_KEY:-django-insecure-change-this-in-production}
-      - DEBUG=${DEBUG:-False}
-      - ALLOWED_HOSTS=${ALLOWED_HOSTS:-*}
+      - DEBUG=${DEBUG:-True}
+      - ALLOWED_HOSTS=${ALLOWED_HOSTS:-localhost;127.0.0.1;192.168.1.129;0.0.0.0}
       - TZ=Asia/Almaty
-    depends_on:
-      db:
-        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"  # Allows access to host machine
+    # Remove depends_on db since we're using local DB
+    # depends_on:
+    #   db:
+    #     condition: service_healthy
     networks:
       - hikvision_network
     # Restart policy for production
