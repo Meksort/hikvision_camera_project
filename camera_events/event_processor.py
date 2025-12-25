@@ -92,15 +92,19 @@ def process_single_camera_event(camera_event):
                 hikvision_id=clean_employee_id,
                 entry_time__date=event_date,
                 exit_time__isnull=True
-            ).order_by('-entry_time').first()
+            ).order_by('entry_time').first()  # Берем самую раннюю запись
             
             if existing:
-                # Обновляем существующую запись, если новый вход позже
-                if event_time > existing.entry_time:
+                # ИСПРАВЛЕНО: Обновляем существующую запись, если новый вход РАНЬШЕ существующего
+                # Это важно для правильного учета ранних входов в отчетах
+                if event_time < existing.entry_time:
                     existing.entry_time = event_time
                     existing.device_name_entry = camera_event.device_name
                     existing.save()
-                    logger.info(f"Обновлена запись EntryExit для сотрудника {clean_employee_id} на {event_date}")
+                    logger.info(f"Обновлена запись EntryExit (более ранний вход) для сотрудника {clean_employee_id} на {event_date}: {event_time}")
+                else:
+                    # Если новый вход позже существующего, не обновляем - сохраняем первый вход
+                    logger.debug(f"Вход {event_time} позже существующего {existing.entry_time}, сохраняем первый вход")
             else:
                 # Создаем новую запись входа
                 EntryExit.objects.create(

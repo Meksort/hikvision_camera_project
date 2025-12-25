@@ -459,6 +459,17 @@ class CameraEventViewSet(viewsets.ModelViewSet):
         - multipart/form-data (с event_log и Picture)
         - application/json
         """
+        # Логирование входящего запроса от камеры
+        client_ip = request.META.get('REMOTE_ADDR', 'unknown')
+        print(f"\n{'='*60}")
+        print(f"📹 ПОЛУЧЕНО СОБЫТИЕ ОТ КАМЕРЫ")
+        print(f"{'='*60}")
+        print(f"IP адрес камеры: {client_ip}")
+        print(f"Время получения: {timezone.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Content-Type: {request.content_type}")
+        print(f"Method: {request.method}")
+        logger.info(f"📹 Получено событие от камеры IP: {client_ip}, Content-Type: {request.content_type}")
+        
         try:
             # Определяем тип контента
             content_type = request.content_type or ""
@@ -908,6 +919,7 @@ class CameraEventViewSet(viewsets.ModelViewSet):
                 
                 # Определяем тип события для логирования
                 event_type_str = "N/A"
+                employee_name_display = employee_name if 'employee_name' in locals() and employee_name else "N/A"
                 try:
                     # Пробуем получить тип события из access_event, если он доступен
                     if 'access_event' in locals() and isinstance(access_event, dict):
@@ -920,7 +932,20 @@ class CameraEventViewSet(viewsets.ModelViewSet):
                 except:
                     pass
                 
+                # Логирование успешного сохранения события
+                print(f"✅ СОБЫТИЕ СОХРАНЕНО:")
+                print(f"   ID сотрудника: {hikvision_id or 'N/A'}")
+                print(f"   Имя: {employee_name_display}")
+                print(f"   Устройство: {device_name or 'N/A'}")
+                print(f"   Время события: {event_time_parsed.strftime('%Y-%m-%d %H:%M:%S') if event_time_parsed else 'N/A'}")
+                print(f"   Тип события: {event_type_str}")
+                print(f"   CameraEvent ID: {camera_event.id}")
+                print(f"{'='*60}\n")
+                
+                logger.info(f"✅ Событие сохранено: ID={hikvision_id}, Имя={employee_name_display}, Устройство={device_name}, Время={event_time_parsed}, CameraEvent ID={camera_event.id}")
+                
             except Exception as e:
+                print(f"❌ ОШИБКА при сохранении события: {e}")
                 logger.error(f"Error creating CameraEvent: {e}", exc_info=True)
                 logger.error(f"Event data: hikvision_id={hikvision_id}, device_name={device_name}, event_time={event_time_parsed}")
                 return HttpResponse("OK", status=200)
