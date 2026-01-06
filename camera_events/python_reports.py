@@ -19,12 +19,16 @@ def is_round_the_clock_morning_entry(dt: datetime) -> bool:
     """
     Проверяет, попадает ли время входа в утреннее окно 07:00–10:00
     для круглосуточного графика.
+    УБРАНО ОГРАНИЧЕНИЕ: теперь принимаем все входы для круглосуточных графиков.
     """
-    if timezone.is_naive(dt):
-        dt = timezone.make_aware(dt)
-    dt_local = timezone.localtime(dt)
-    t = dt_local.time()
-    return time(7, 0) <= t <= time(10, 0)
+    # УБРАНО ОГРАНИЧЕНИЕ: принимаем все входы для круглосуточных графиков
+    # Если нужно вернуть ограничение, раскомментируйте строки ниже:
+    # if timezone.is_naive(dt):
+    #     dt = timezone.make_aware(dt)
+    # dt_local = timezone.localtime(dt)
+    # t = dt_local.time()
+    # return time(7, 0) <= t <= time(10, 0)
+    return True
 
 
 def is_work_day_for_schedule(schedule: WorkSchedule, check_date: date) -> bool:
@@ -232,12 +236,11 @@ def generate_comprehensive_attendance_report_python(
             # Определяем период для входа/выхода
             if schedule.schedule_type == 'round_the_clock':
                 # Новая логика для круглосуточных графиков:
-                # - Берем только утренние входы в окне 07:00–10:00
+                # - Берем ВСЕ входы (ограничение 07:00–10:00 убрано)
                 # - Период (дата графика) = календарная дата этого входа
                 # - Выход относится к тому же периоду, даже если он на следующий день
-                if not is_round_the_clock_morning_entry(entry_time):
-                    # Вход вне окна 07:00–10:00 в графике не учитываем
-                    continue
+                # - Если выход в тот же день, что и вход, и продолжительность < 20 часов,
+                #   то это неправильная запись, но мы все равно включаем её в отчет
                 period_date = entry_local.date()
                 
                 key = (ee.hikvision_id, period_date)

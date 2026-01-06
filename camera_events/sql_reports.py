@@ -502,11 +502,12 @@ def generate_comprehensive_attendance_report_sql(
             GROUP BY hikvision_id, period_date
         ),
         -- Предварительно вычисляем среднее время входов для круглосуточных графиков
+        -- УБРАНО ОГРАНИЧЕНИЕ: теперь учитываем все входы, не только в окне 07:00-10:00
         round_the_clock_avg_entry AS (
             SELECT 
                 hikvision_id,
                 period_date,
-                -- Среднее время входов между 7:00 и 10:00
+                -- Среднее время всех входов (приоритет входов в окне 7:00-10:00, если их нет - любые входы)
                 CASE 
                     WHEN COUNT(CASE 
                         WHEN EXTRACT(HOUR FROM entry_local) >= 7 
@@ -523,8 +524,10 @@ def generate_comprehensive_attendance_report_sql(
                          END) * INTERVAL '1 second'
                         )::timestamp
                     ELSE 
-                        -- Если нет входов в промежутке 7:00-10:00, используем среднее время (8:30)
-                        (DATE(period_date) + '08:30:00'::time)::timestamp
+                        -- Если нет входов в промежутке 7:00-10:00, используем среднее время всех входов
+                        (DATE(period_date) + 
+                         AVG(EXTRACT(EPOCH FROM (entry_local::time - '00:00:00'::time))) * INTERVAL '1 second'
+                        )::timestamp
                 END as avg_entry_time
             FROM entry_exits_with_period
             WHERE schedule_type = 'round_the_clock'
@@ -548,8 +551,9 @@ def generate_comprehensive_attendance_report_sql(
                 eep.allowed_late_minutes,
                 eep.allowed_early_leave_minutes,
                 eep.schedule_days_of_week,
-                -- Для круглосуточных графиков: если есть входы в окне 07:00–10:00,
-                -- берем самый ранний из них, иначе берем самый ранний вход за день.
+                -- Для круглосуточных графиков: 
+                -- Приоритет: сначала входы в окне 07:00–10:00, если их нет - любой вход за день
+                -- УБРАНО СТРОГОЕ ОГРАНИЧЕНИЕ: теперь все входы учитываются
                 CASE 
                     WHEN eep.schedule_type = 'round_the_clock' THEN
                         COALESCE(
@@ -561,7 +565,7 @@ def generate_comprehensive_attendance_report_sql(
                                     ELSE NULL
                                 END
                             ),
-                            MIN(eep.entry_local)
+                            MIN(eep.entry_local)  -- Если нет входов в окне 07:00–10:00, берем любой вход
                         )
                     ELSE 
                         MIN(eep.entry_local)
