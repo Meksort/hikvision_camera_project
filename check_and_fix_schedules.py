@@ -603,6 +603,93 @@ def check_all_employees(start_date: date, end_date: date) -> List[Dict]:
     return results
 
 
+def remove_records_without_shift(start_date: date, end_date: date) -> Dict:
+    """
+    Удаляет записи EntryExit за дни, когда не было смены (24 часа работы).
+    "24" в табеле = была смена = есть запись с продолжительностью 20-30 часов.
+    Если нет смены - удаляем запись, чтобы она не попадала в отчеты.
+    
+    Args:
+        start_date: Начальная дата для проверки
+        end_date: Конечная дата для проверки
+        
+    Returns:
+        Словарь со статистикой удалений
+    """
+    logger.info(f"Удаление записей без смены за период {start_date} - {end_date}")
+    
+    removed_count = 0
+    checked_count = 0
+    employees_processed = set()
+    
+    # Получаем всех сотрудников с круглосуточными графиками
+    employees_with_round_clock = Employee.objects.filter(
+        work_schedules__schedule_type='round_the_clock'
+    ).distinct().select_related('department').prefetch_related('work_schedules')
+    
+    print(f"\nПроверка {employees_with_round_clock.count()} сотрудников с круглосуточными графиками...")
+    
+    start_datetime = timezone.make_aware(datetime.combine(start_date, datetime.min.time()))
+    end_datetime = timezone.make_aware(datetime.combine(end_date + timedelta(days=1), datetime.min.time()))
+    
+    for employee in employees_with_round_clock:
+        try:
+            # Получаем все записи за период
+            entries = EntryExit.objects.filter(
+                hikvision_id=employee.hikvision_id,
+                entry_time__gte=start_datetime,
+                entry_time__lt=end_datetime
+            ).order_by('entry_time')
+            
+            for entry_exit in entries:
+                checked_count += 1
+                entry_local = timezone.localtime(entry_exit.entry_time)
+                entry_date = entry_local.date()
+                
+                # Проверяем, была ли смена (24 часа работы) в этот день
+                had_shift = has_shift_on_date(employee, entry_date)
+                
+                # Если не было смены - удаляем запись
+                if not had_shift:
+                    entry_exit.delete()
+                    removed_count += 1
+                    employees_processed.add(employee.name)
+                    
+                    logger.info(
+                        f"Удалена запись без смены для {employee.name} на {entry_date}: "
+                        f"вход {entry_local.strftime('%Y-%m-%d %H:%M:%S')}"
+                    )
+                    
+                    if removed_count % 10 == 0:
+                        print(f"  Удалено записей: {removed_count}...")
+        
+        except Exception as e:
+            logger.error(f"Ошибка при обработке сотрудника {employee.name}: {e}")
+    
+    print(f"\nИтоги удаления:")
+    print(f"  Проверено записей: {checked_count}")
+    print(f"  Удалено записей без смены: {removed_count}")
+    print(f"  Затронуто сотрудников: {len(employees_processed)}")
+    
+    if employees_processed:
+        print(f"\n  Сотрудники с удаленными записями:")
+        for name in sorted(employees_processed)[:20]:
+            print(f"    - {name}")
+        if len(employees_processed) > 20:
+            print(f"    ... и еще {len(employees_processed) - 20} сотрудников")
+    
+    logger.info(
+        f"Итоги удаления: проверено {checked_count}, удалено {removed_count}, "
+        f"затронуто сотрудников {len(employees_processed)}"
+    )
+    
+    return {
+        'checked': checked_count,
+        'removed': removed_count,
+        'employees_affected': len(employees_processed)
+    }
+
+
 def fix_all_invalid_durations(start_date: date, end_date: date) -> Dict:
     """
     Исправляет все записи с неправильной продолжительностью для круглосуточных графиков.
@@ -962,6 +1049,11 @@ def main():
         action='store_true',
         help='Исправить все записи с неправильной продолжительностью для всех сотрудников'
     )
+    parser.add_argument(
+        '--remove-without-shift',
+        action='store_true',
+        help='Удалить записи за дни без смены (24 часа работы) для всех сотрудников'
+    )
     
     args = parser.parse_args()
     
@@ -1030,11 +1122,21 @@ def main():
         else:
             print("\n✓ Все сотрудники имеют полные графики")
     
+    # Удаление записей без смены (если указан флаг)
+    if args.remove_without_shift:
+        print("\n" + "=" * 80)
+        print("2. УДАЛЕНИЕ ЗАПИСЕЙ БЕЗ СМЕНЫ (24 ЧАСА РАБОТЫ)")
+        print("-" * 80)
+        remove_stats = remove_records_without_shift(start_date, end_date)
+        print(f"\nПроверено записей: {remove_stats['checked']}")
+        print(f"Удалено записей без смены: {remove_stats['removed']}")
+        print(f"Затронуто сотрудников: {remove_stats['employees_affected']}")
+    
     # Исправление всех записей с неправильной продолжительностью
     # Запускается автоматически, если не указан --check-only
     if not args.check_only or args.fix_all_durations:
         print("\n" + "=" * 80)
-        print("2. ИСПРАВЛЕНИЕ ВСЕХ ЗАПИСЕЙ С НЕПРАВИЛЬНОЙ ПРОДОЛЖИТЕЛЬНОСТЬЮ")
+        print("3. ИСПРАВЛЕНИЕ ВСЕХ ЗАПИСЕЙ С НЕПРАВИЛЬНОЙ ПРОДОЛЖИТЕЛЬНОСТЬЮ")
         print("-" * 80)
         fix_stats = fix_all_invalid_durations(start_date, end_date)
         print(f"\nПроверено записей: {fix_stats['checked']}")
@@ -1044,7 +1146,7 @@ def main():
     # Создание недостающих записей
     if not args.check_only:
         print("\n" + "=" * 80)
-        print("3. СОЗДАНИЕ НЕДОСТАЮЩИХ ЗАПИСЕЙ")
+        print("4. СОЗДАНИЕ НЕДОСТАЮЩИХ ЗАПИСЕЙ")
         print("-" * 80)
         stats = create_missing_records(year=start_date.year, month=start_date.month)
         print(f"\nСоздано новых записей: {stats['created']}")
