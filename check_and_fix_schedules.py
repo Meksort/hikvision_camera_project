@@ -79,6 +79,70 @@ EMPLOYEE_SCHEDULE_DATA = {
     },
 }
 
+# Рабочие дни для каждого сотрудника (из табеля)
+EMPLOYEE_WORK_DAYS = {
+    'Исаев': {
+        'work_days': [2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18, 19, 20, 21, 23, 24, 26, 27, 29, 30],
+        'department_hint': ''
+    },
+    'Сегизбай': {
+        'work_days': [2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18, 20, 21, 23, 24, 26, 27, 29, 30],
+        'department_hint': ''
+    },
+    'Акбай': {
+        'work_days': [2, 5, 8, 11, 17, 20, 23, 26, 27, 29],
+        'department_hint': ''
+    },
+    'Тайтелиева': {
+        'work_days': [2, 5, 8, 12, 14, 29],
+        'department_hint': ''
+    },
+    'Кадирбаев': {
+        'work_days': [3, 6, 9, 12, 15, 18, 21, 22, 23, 24, 28, 30],
+        'department_hint': 'СВК'
+    },
+    'Тортаев': {
+        'work_days': [2, 3, 6, 8, 9, 11, 12, 14, 15, 17, 18, 20, 21, 23, 24, 26, 27, 29, 30],
+        'department_hint': ''
+    },
+    'Кужахметов': {
+        'work_days': [1, 3, 4, 6, 7, 9, 10, 12, 13, 15, 16, 18, 19, 21, 22, 23, 24, 25, 27, 28, 30, 31],
+        'department_hint': ''
+    },
+    'Укенбаева': {
+        'work_days': [3, 6, 9, 11, 15, 18, 21, 24, 26, 27, 30],
+        'department_hint': 'СВК'
+    },
+    'Мусаева': {
+        'work_days': [2, 3, 6, 9, 12, 14, 15, 18, 20, 21, 24, 27, 30],
+        'department_hint': 'СВК'
+    },
+    'Сарсекенов': {
+        'work_days': [1, 2, 4, 5, 7, 8, 10, 13, 14, 16, 17, 19, 20, 22, 23, 25, 26, 28, 29, 31],
+        'department_hint': 'СВК'
+    },
+    'Касымшалов': {
+        'work_days': [1, 4, 5, 7, 10, 11, 13, 14, 16, 19, 22, 23, 25, 27, 28, 31],
+        'department_hint': 'СВК'
+    },
+    'Смагулов': {
+        'work_days': [1, 4, 7, 10, 13, 16, 19, 22, 25, 28, 31],
+        'department_hint': ''
+    },
+    'Калжанов': {
+        'work_days': [1, 4, 7, 10, 13, 16, 25, 28, 31],
+        'department_hint': ''
+    },
+    'Мухпулова': {
+        'work_days': [1, 4, 7, 8, 10, 13, 16, 17, 19, 22, 25, 28, 31],
+        'department_hint': ''
+    },
+    'Сыздыкова': {
+        'work_days': [1, 4, 5, 7, 10, 11, 13, 16, 19, 22, 24, 25, 28, 31],
+        'department_hint': ''
+    },
+}
+
 
 def find_employee_by_name(name_part: str, department_hint: str = '') -> Optional[Employee]:
     """
@@ -603,6 +667,240 @@ def check_all_employees(start_date: date, end_date: date) -> List[Dict]:
     return results
 
 
+def remove_records_outside_work_days(start_date: date, end_date: date) -> Dict:
+    """
+    Удаляет записи EntryExit за даты, которые НЕ входят в рабочие дни для каждого сотрудника.
+    Для рабочих дней - оставляет записи (время входа и выхода).
+    Для нерабочих дней - удаляет записи (чтобы в отчете были пустые клетки).
+    
+    Args:
+        start_date: Начальная дата для проверки
+        end_date: Конечная дата для проверки
+        
+    Returns:
+        Словарь со статистикой удалений
+    """
+    logger.info(f"Удаление записей за нерабочие дни за период {start_date} - {end_date}")
+    
+    removed_count = 0
+    checked_count = 0
+    employees_processed = set()
+    dates_removed = {}  # Для статистики по датам
+    
+    print(f"\nУдаление записей за нерабочие дни...")
+    print("Логика: оставляем записи только за рабочие дни, удаляем за остальные дни")
+    print("-" * 80)
+    
+    start_datetime = timezone.make_aware(datetime.combine(start_date, datetime.min.time()))
+    end_datetime = timezone.make_aware(datetime.combine(end_date + timedelta(days=1), datetime.min.time()))
+    
+    for employee_name, data in EMPLOYEE_WORK_DAYS.items():
+        work_days = data.get('work_days', [])
+        department_hint = data.get('department_hint', '')
+        
+        if not work_days:
+            continue
+        
+        # Находим сотрудника
+        employee = find_employee_by_name(employee_name, department_hint)
+        if not employee:
+            logger.warning(f"Сотрудник '{employee_name}' не найден")
+            continue
+        
+        print(f"\n{employee.name} (ID: {employee.hikvision_id}):")
+        print(f"  Рабочие дни: {work_days}")
+        
+        # Получаем все записи за период
+        entries = EntryExit.objects.filter(
+            hikvision_id=employee.hikvision_id,
+            entry_time__gte=start_datetime,
+            entry_time__lt=end_datetime
+        ).order_by('entry_time')
+        
+        # Проверяем каждую запись
+        for entry_exit in entries:
+            checked_count += 1
+            entry_local = timezone.localtime(entry_exit.entry_time)
+            entry_date = entry_local.date()
+            day_number = entry_date.day
+            
+            # Если день НЕ входит в рабочие дни - удаляем запись
+            if day_number not in work_days:
+                entry_exit.delete()
+                removed_count += 1
+                employees_processed.add(employee.name)
+                
+                # Статистика по датам
+                date_key = f"{entry_date}"
+                if date_key not in dates_removed:
+                    dates_removed[date_key] = 0
+                dates_removed[date_key] += 1
+                
+                print(f"  ✗ Удалена запись на {entry_date} (день {day_number} - не рабочий)")
+                
+                logger.info(
+                    f"Удалена запись для {employee.name} на {entry_date} (день {day_number} - не рабочий): "
+                    f"вход {entry_local.strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+            else:
+                print(f"  ✓ Оставлена запись на {entry_date} (день {day_number} - рабочий)")
+        
+        if removed_count % 10 == 0 and removed_count > 0:
+            print(f"\n  Всего удалено записей: {removed_count}...")
+    
+    print(f"\n" + "=" * 80)
+    print(f"ИТОГИ УДАЛЕНИЯ:")
+    print(f"=" * 80)
+    print(f"  Проверено записей: {checked_count}")
+    print(f"  Удалено записей за нерабочие дни: {removed_count}")
+    print(f"  Затронуто сотрудников: {len(employees_processed)}")
+    
+    if dates_removed:
+        print(f"\n  Удалено записей по датам (топ-10):")
+        sorted_dates = sorted(dates_removed.items(), key=lambda x: x[1], reverse=True)[:10]
+        for date_key, count in sorted_dates:
+            print(f"    {date_key}: {count} записей")
+    
+    if employees_processed:
+        print(f"\n  Сотрудники с удаленными записями:")
+        for name in sorted(employees_processed):
+            print(f"    - {name}")
+    
+    logger.info(
+        f"Итоги удаления: проверено {checked_count}, удалено {removed_count}, "
+        f"затронуто сотрудников {len(employees_processed)}"
+    )
+    
+    return {
+        'checked': checked_count,
+        'removed': removed_count,
+        'employees_affected': len(employees_processed),
+        'dates_removed': dates_removed
+    }
+
+
+def remove_records_for_specific_employees_and_dates() -> Dict:
+    """
+    Удаляет записи EntryExit для конкретных сотрудников и конкретных дат,
+    где в табеле пусто (нет "24" = продолжительность меньше 20 часов).
+    
+    Использует данные из EMPLOYEE_SCHEDULE_DATA для определения сотрудников и дат.
+    Удаляет только те записи, где продолжительность меньше 20 часов (нет смены).
+    
+    Returns:
+        Словарь со статистикой удалений
+    """
+    logger.info("Удаление записей для конкретных сотрудников и дат (где в табеле пусто)")
+    
+    removed_count = 0
+    checked_count = 0
+    employees_processed = set()
+    dates_removed = {}  # Для статистики по датам
+    
+    print(f"\nУдаление записей для конкретных сотрудников и дат...")
+    print("Логика: удаляем записи за указанные даты, где продолжительность < 20 часов (нет '24' в табеле)")
+    print("-" * 80)
+    
+    for employee_name, data in EMPLOYEE_SCHEDULE_DATA.items():
+        dates = data.get('dates', [])
+        department_hint = data.get('department_hint', '')
+        
+        if not dates:
+            continue
+        
+        # Находим сотрудника
+        employee = find_employee_by_name(employee_name, department_hint)
+        if not employee:
+            logger.warning(f"Сотрудник '{employee_name}' не найден")
+            continue
+        
+        print(f"\n{employee.name} (ID: {employee.hikvision_id}):")
+        
+        for day in dates:
+            checked_count += 1
+            target_date = date(2025, 12, day)
+            
+            # Ищем записи за этот день
+            start_datetime = timezone.make_aware(datetime.combine(target_date, datetime.min.time()))
+            end_datetime = timezone.make_aware(datetime.combine(target_date + timedelta(days=1), datetime.min.time()))
+            
+            entries = EntryExit.objects.filter(
+                hikvision_id=employee.hikvision_id,
+                entry_time__gte=start_datetime,
+                entry_time__lt=end_datetime
+            )
+            
+            # Проверяем каждую запись
+            for entry_exit in entries:
+                # Пропускаем записи без выхода
+                if not entry_exit.exit_time:
+                    continue
+                
+                # Вычисляем продолжительность
+                duration_hours = 0
+                if entry_exit.work_duration_seconds:
+                    duration_hours = entry_exit.work_duration_seconds / 3600
+                else:
+                    entry_local = timezone.localtime(entry_exit.entry_time)
+                    exit_local = timezone.localtime(entry_exit.exit_time)
+                    duration_seconds = int((exit_local - entry_local).total_seconds())
+                    duration_hours = duration_seconds / 3600
+                
+                # Если продолжительность меньше 20 часов - это не смена (пусто в табеле)
+                # Удаляем запись
+                if duration_hours < 20:
+                    entry_local = timezone.localtime(entry_exit.entry_time)
+                    entry_exit.delete()
+                    removed_count += 1
+                    employees_processed.add(employee.name)
+                    
+                    # Статистика по датам
+                    date_key = f"{target_date}"
+                    if date_key not in dates_removed:
+                        dates_removed[date_key] = 0
+                    dates_removed[date_key] += 1
+                    
+                    print(f"  ✓ Удалена запись на {target_date}: продолжительность {duration_hours:.1f}ч (нет '24' в табеле)")
+                    
+                    logger.info(
+                        f"Удалена запись для {employee.name} на {target_date}: "
+                        f"вход {entry_local.strftime('%Y-%m-%d %H:%M:%S')}, "
+                        f"продолжительность {duration_hours:.1f}ч (нет '24' в табеле)"
+                    )
+                else:
+                    print(f"  - Запись на {target_date}: продолжительность {duration_hours:.1f}ч (есть '24' в табеле, оставляем)")
+    
+    print(f"\n" + "=" * 80)
+    print(f"ИТОГИ УДАЛЕНИЯ:")
+    print(f"=" * 80)
+    print(f"  Проверено записей: {checked_count}")
+    print(f"  Удалено записей без смены (пусто в табеле): {removed_count}")
+    print(f"  Затронуто сотрудников: {len(employees_processed)}")
+    
+    if dates_removed:
+        print(f"\n  Удалено записей по датам:")
+        sorted_dates = sorted(dates_removed.items(), key=lambda x: x[0])
+        for date_key, count in sorted_dates:
+            print(f"    {date_key}: {count} записей")
+    
+    if employees_processed:
+        print(f"\n  Сотрудники с удаленными записями:")
+        for name in sorted(employees_processed):
+            print(f"    - {name}")
+    
+    logger.info(
+        f"Итоги удаления: проверено {checked_count}, удалено {removed_count}, "
+        f"затронуто сотрудников {len(employees_processed)}"
+    )
+    
+    return {
+        'checked': checked_count,
+        'removed': removed_count,
+        'employees_affected': len(employees_processed),
+        'dates_removed': dates_removed
+    }
+
+
 def remove_records_without_shift(start_date: date, end_date: date) -> Dict:
     """
     Удаляет записи EntryExit за дни, когда в табеле нет "24" (нет смены).
@@ -1088,6 +1386,16 @@ def main():
         action='store_true',
         help='Удалить записи за дни без смены (24 часа работы) для всех сотрудников'
     )
+    parser.add_argument(
+        '--remove-specific',
+        action='store_true',
+        help='Удалить записи для конкретных сотрудников и дат (где в табеле пусто)'
+    )
+    parser.add_argument(
+        '--remove-outside-work-days',
+        action='store_true',
+        help='Удалить записи за нерабочие дни (оставить только рабочие дни из табеля)'
+    )
     
     args = parser.parse_args()
     
@@ -1156,10 +1464,30 @@ def main():
         else:
             print("\n✓ Все сотрудники имеют полные графики")
     
+    # Удаление записей за нерабочие дни (если указан флаг)
+    if args.remove_outside_work_days:
+        print("\n" + "=" * 80)
+        print("2. УДАЛЕНИЕ ЗАПИСЕЙ ЗА НЕРАБОЧИЕ ДНИ (ОСТАВИТЬ ТОЛЬКО РАБОЧИЕ ДНИ)")
+        print("-" * 80)
+        remove_stats = remove_records_outside_work_days(start_date, end_date)
+        print(f"\nПроверено записей: {remove_stats['checked']}")
+        print(f"Удалено записей за нерабочие дни: {remove_stats['removed']}")
+        print(f"Затронуто сотрудников: {remove_stats['employees_affected']}")
+    
+    # Удаление записей для конкретных сотрудников и дат (если указан флаг)
+    if args.remove_specific:
+        print("\n" + "=" * 80)
+        print("3. УДАЛЕНИЕ ЗАПИСЕЙ ДЛЯ КОНКРЕТНЫХ СОТРУДНИКОВ И ДАТ (ГДЕ В ТАБЕЛЕ ПУСТО)")
+        print("-" * 80)
+        remove_stats = remove_records_for_specific_employees_and_dates()
+        print(f"\nПроверено записей: {remove_stats['checked']}")
+        print(f"Удалено записей без смены: {remove_stats['removed']}")
+        print(f"Затронуто сотрудников: {remove_stats['employees_affected']}")
+    
     # Удаление записей без смены (если указан флаг)
     if args.remove_without_shift:
         print("\n" + "=" * 80)
-        print("2. УДАЛЕНИЕ ЗАПИСЕЙ БЕЗ СМЕНЫ (24 ЧАСА РАБОТЫ)")
+        print("4. УДАЛЕНИЕ ЗАПИСЕЙ БЕЗ СМЕНЫ (24 ЧАСА РАБОТЫ) ДЛЯ ВСЕХ СОТРУДНИКОВ")
         print("-" * 80)
         remove_stats = remove_records_without_shift(start_date, end_date)
         print(f"\nПроверено записей: {remove_stats['checked']}")
@@ -1170,7 +1498,7 @@ def main():
     # Запускается автоматически, если не указан --check-only
     if not args.check_only or args.fix_all_durations:
         print("\n" + "=" * 80)
-        print("3. ИСПРАВЛЕНИЕ ВСЕХ ЗАПИСЕЙ С НЕПРАВИЛЬНОЙ ПРОДОЛЖИТЕЛЬНОСТЬЮ")
+        print("5. ИСПРАВЛЕНИЕ ВСЕХ ЗАПИСЕЙ С НЕПРАВИЛЬНОЙ ПРОДОЛЖИТЕЛЬНОСТЬЮ")
         print("-" * 80)
         fix_stats = fix_all_invalid_durations(start_date, end_date)
         print(f"\nПроверено записей: {fix_stats['checked']}")
@@ -1180,7 +1508,7 @@ def main():
     # Создание недостающих записей
     if not args.check_only:
         print("\n" + "=" * 80)
-        print("4. СОЗДАНИЕ НЕДОСТАЮЩИХ ЗАПИСЕЙ")
+        print("6. СОЗДАНИЕ НЕДОСТАЮЩИХ ЗАПИСЕЙ")
         print("-" * 80)
         stats = create_missing_records(year=start_date.year, month=start_date.month)
         print(f"\nСоздано новых записей: {stats['created']}")
