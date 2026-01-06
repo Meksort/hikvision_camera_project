@@ -1,0 +1,46 @@
+# Скрипт для обновления и запуска check_and_fix_schedules.py в Docker контейнере
+
+Write-Host "=" * 80 -ForegroundColor Cyan
+Write-Host "ОБНОВЛЕНИЕ И ЗАПУСК СКРИПТА ИСПРАВЛЕНИЯ ГРАФИКОВ" -ForegroundColor Cyan
+Write-Host "=" * 80 -ForegroundColor Cyan
+Write-Host ""
+
+# Получаем ID контейнера
+$containerId = docker ps -q -f "name=hikvision_web"
+
+if (-not $containerId) {
+    Write-Host "ОШИБКА: Контейнер hikvision_web не найден!" -ForegroundColor Red
+    Write-Host "Убедитесь, что контейнер запущен: docker-compose up -d" -ForegroundColor Yellow
+    exit 1
+}
+
+Write-Host "Найден контейнер: $containerId" -ForegroundColor Green
+Write-Host ""
+
+# Копируем файл в контейнер
+Write-Host "Копирование обновленного файла в контейнер..." -ForegroundColor Yellow
+docker cp check_and_fix_schedules.py "${containerId}:/app/check_and_fix_schedules.py"
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "ОШИБКА: Не удалось скопировать файл!" -ForegroundColor Red
+    exit 1
+}
+
+Write-Host "✓ Файл успешно скопирован" -ForegroundColor Green
+Write-Host ""
+
+# Запускаем скрипт с переданными аргументами
+Write-Host "Запуск скрипта..." -ForegroundColor Cyan
+Write-Host ""
+
+$argsString = $args -join " "
+docker exec -it $containerId python /app/check_and_fix_schedules.py $argsString
+
+if ($LASTEXITCODE -eq 0) {
+    Write-Host ""
+    Write-Host "✓ Скрипт выполнен успешно!" -ForegroundColor Green
+} else {
+    Write-Host ""
+    Write-Host "✗ Ошибка при выполнении скрипта!" -ForegroundColor Red
+}
+

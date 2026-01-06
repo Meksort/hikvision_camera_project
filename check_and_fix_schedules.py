@@ -605,9 +605,11 @@ def check_all_employees(start_date: date, end_date: date) -> List[Dict]:
 
 def remove_records_without_shift(start_date: date, end_date: date) -> Dict:
     """
-    Удаляет записи EntryExit за дни, когда не было смены (24 часа работы).
-    "24" в табеле = была смена = есть запись с продолжительностью 20-30 часов.
-    Если нет смены - удаляем запись, чтобы она не попадала в отчеты.
+    Удаляет записи EntryExit за дни, когда в табеле нет "24" (нет смены).
+    
+    Логика:
+    - Если в табеле стоит "24" = есть запись с продолжительностью 20-30 часов - ОСТАВЛЯЕМ запись
+    - Если в табеле пусто = нет записи или продолжительность меньше 20 часов - УДАЛЯЕМ запись полностью
     
     Args:
         start_date: Начальная дата для проверки
@@ -616,11 +618,12 @@ def remove_records_without_shift(start_date: date, end_date: date) -> Dict:
     Returns:
         Словарь со статистикой удалений
     """
-    logger.info(f"Удаление записей без смены за период {start_date} - {end_date}")
+    logger.info(f"Удаление записей без смены (где в табеле нет '24') за период {start_date} - {end_date}")
     
     removed_count = 0
     checked_count = 0
     employees_processed = set()
+    dates_removed = {}  # Для статистики по датам
     
     # Получаем всех сотрудников с круглосуточными графиками
     employees_with_round_clock = Employee.objects.filter(
@@ -628,6 +631,8 @@ def remove_records_without_shift(start_date: date, end_date: date) -> Dict:
     ).distinct().select_related('department').prefetch_related('work_schedules')
     
     print(f"\nПроверка {employees_with_round_clock.count()} сотрудников с круглосуточными графиками...")
+    print("Логика: '24' в табеле = оставляем, пусто в табеле = удаляем")
+    print("-" * 80)
     
     start_datetime = timezone.make_aware(datetime.combine(start_date, datetime.min.time()))
     end_datetime = timezone.make_aware(datetime.combine(end_date + timedelta(days=1), datetime.min.time()))
@@ -641,24 +646,65 @@ def remove_records_without_shift(start_date: date, end_date: date) -> Dict:
                 entry_time__lt=end_datetime
             ).order_by('entry_time')
             
+            # Группируем записи по дате входа
+            entries_by_date = {}
             for entry_exit in entries:
-                checked_count += 1
                 entry_local = timezone.localtime(entry_exit.entry_time)
                 entry_date = entry_local.date()
                 
-                # Проверяем, была ли смена (24 часа работы) в этот день
-                had_shift = has_shift_on_date(employee, entry_date)
+                if entry_date not in entries_by_date:
+                    entries_by_date[entry_date] = []
+                entries_by_date[entry_date].append(entry_exit)
+            
+            # Проверяем каждую дату
+            for entry_date, date_entries in entries_by_date.items():
+                checked_count += len(date_entries)
                 
-                # Если не было смены - удаляем запись
-                if not had_shift:
-                    entry_exit.delete()
-                    removed_count += 1
-                    employees_processed.add(employee.name)
+                # Проверяем, есть ли хотя бы одна запись с продолжительностью 20-30 часов (смена = "24" в табеле)
+                has_valid_shift = False
+                max_duration_hours = 0
+                
+                for entry_exit in date_entries:
+                    duration_hours = 0
                     
-                    logger.info(
-                        f"Удалена запись без смены для {employee.name} на {entry_date}: "
-                        f"вход {entry_local.strftime('%Y-%m-%d %H:%M:%S')}"
-                    )
+                    # Проверяем work_duration_seconds
+                    if entry_exit.exit_time and entry_exit.work_duration_seconds:
+                        duration_hours = entry_exit.work_duration_seconds / 3600
+                    # Если нет work_duration_seconds, проверяем вручную
+                    elif entry_exit.exit_time:
+                        entry_local = timezone.localtime(entry_exit.entry_time)
+                        exit_local = timezone.localtime(entry_exit.exit_time)
+                        duration_seconds = int((exit_local - entry_local).total_seconds())
+                        duration_hours = duration_seconds / 3600
+                    
+                    if duration_hours > max_duration_hours:
+                        max_duration_hours = duration_hours
+                    
+                    # Если продолжительность 20-30 часов - это смена ("24" в табеле)
+                    if 20 <= duration_hours <= 30:
+                        has_valid_shift = True
+                        break
+                
+                # Если нет смены (20-30 часов) - удаляем все записи за этот день
+                # Это означает, что в табеле пусто (нет "24")
+                if not has_valid_shift:
+                    for entry_exit in date_entries:
+                        entry_local = timezone.localtime(entry_exit.entry_time)
+                        entry_exit.delete()
+                        removed_count += 1
+                        employees_processed.add(employee.name)
+                        
+                        # Статистика по датам
+                        date_key = f"{entry_date}"
+                        if date_key not in dates_removed:
+                            dates_removed[date_key] = 0
+                        dates_removed[date_key] += 1
+                        
+                        logger.info(
+                            f"Удалена запись без смены для {employee.name} на {entry_date}: "
+                            f"вход {entry_local.strftime('%Y-%m-%d %H:%M:%S')}, "
+                            f"продолжительность {max_duration_hours:.1f}ч (нет '24' в табеле)"
+                        )
                     
                     if removed_count % 10 == 0:
                         print(f"  Удалено записей: {removed_count}...")
@@ -666,10 +712,18 @@ def remove_records_without_shift(start_date: date, end_date: date) -> Dict:
         except Exception as e:
             logger.error(f"Ошибка при обработке сотрудника {employee.name}: {e}")
     
-    print(f"\nИтоги удаления:")
+    print(f"\n" + "=" * 80)
+    print(f"ИТОГИ УДАЛЕНИЯ:")
+    print(f"=" * 80)
     print(f"  Проверено записей: {checked_count}")
-    print(f"  Удалено записей без смены: {removed_count}")
+    print(f"  Удалено записей без смены (пусто в табеле): {removed_count}")
     print(f"  Затронуто сотрудников: {len(employees_processed)}")
+    
+    if dates_removed:
+        print(f"\n  Удалено записей по датам (топ-10):")
+        sorted_dates = sorted(dates_removed.items(), key=lambda x: x[1], reverse=True)[:10]
+        for date_key, count in sorted_dates:
+            print(f"    {date_key}: {count} записей")
     
     if employees_processed:
         print(f"\n  Сотрудники с удаленными записями:")
@@ -686,7 +740,8 @@ def remove_records_without_shift(start_date: date, end_date: date) -> Dict:
     return {
         'checked': checked_count,
         'removed': removed_count,
-        'employees_affected': len(employees_processed)
+        'employees_affected': len(employees_processed),
+        'dates_removed': dates_removed
     }
 
 
