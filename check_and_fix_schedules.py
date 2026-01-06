@@ -186,13 +186,53 @@ def check_employee_schedule(employee: Employee, start_date: date, end_date: date
             exit_time__isnull=False
         )
         
+        # Получаем график работы для проверки типа
+        schedule = employee.work_schedules.first()
+        is_round_the_clock = schedule and schedule.schedule_type == 'round_the_clock'
+        
+        # Проверяем качество записей
+        has_valid_entry = False
+        has_invalid_duration = False
+        
+        if complete_entries.exists():
+            for ee in complete_entries:
+                entry_local = timezone.localtime(ee.entry_time)
+                exit_local = timezone.localtime(ee.exit_time)
+                
+                # Для круглосуточных графиков проверяем продолжительность
+                if is_round_the_clock:
+                    # Проверяем, что вход в окне 07:00-10:00
+                    entry_time_local = entry_local.time()
+                    if time(7, 0) <= entry_time_local <= time(10, 0):
+                        duration_seconds = int((exit_local - entry_local).total_seconds())
+                        duration_hours = duration_seconds / 3600
+                        
+                        # Для круглосуточных графиков продолжительность должна быть около 20-26 часов
+                        if duration_hours >= 20:
+                            has_valid_entry = True
+                        else:
+                            has_invalid_duration = True
+                            logger.debug(
+                                f"{employee.name} {current_date}: неправильная продолжительность "
+                                f"{duration_hours:.1f}ч (ожидается ~24ч)"
+                            )
+                else:
+                    has_valid_entry = True
+        elif has_entry and not has_exit:
+            # Есть вход, но нет выхода
+            pass  # Будет обработано ниже
+        
         if has_entry:
             result['days_with_entry'] += 1
         if has_exit:
             result['days_with_exit'] += 1
         
-        if complete_entries.exists():
+        if has_valid_entry:
             result['days_complete'] += 1
+        elif has_invalid_duration:
+            # Есть запись, но с неправильной продолжительностью
+            result['days_incomplete'] += 1
+            result['incomplete_dates'].append(current_date)
         elif has_entry and not has_exit:
             # Есть вход, но нет выхода
             result['days_incomplete'] += 1
@@ -270,7 +310,7 @@ def create_entry_exit_for_date(
     exit_date_offset: Optional[int] = None
 ) -> Tuple[EntryExit, bool]:
     """
-    Создает запись EntryExit для указанной даты.
+    Создает или исправляет запись EntryExit для указанной даты.
     
     Args:
         employee: Сотрудник
@@ -283,6 +323,111 @@ def create_entry_exit_for_date(
     Returns:
         Кортеж (EntryExit объект, created: bool)
     """
+    # Получаем график работы сотрудника
+    schedule = employee.work_schedules.first()
+    is_round_the_clock = schedule and schedule.schedule_type == 'round_the_clock'
+    
+    # Проверяем существующие записи за этот день и соседние дни
+    start_datetime = timezone.make_aware(datetime.combine(target_date, datetime.min.time()))
+    end_datetime = timezone.make_aware(datetime.combine(target_date + timedelta(days=2), datetime.min.time()))
+    
+    existing_entries = EntryExit.objects.filter(
+        hikvision_id=employee.hikvision_id,
+        entry_time__gte=start_datetime,
+        entry_time__lt=end_datetime
+    ).order_by('entry_time')
+    
+    # Ищем запись, которая относится к target_date
+    existing = None
+    for ee in existing_entries:
+        entry_local = timezone.localtime(ee.entry_time)
+        entry_date_local = entry_local.date()
+        
+        # Для круглосуточных графиков: запись относится к target_date, если вход в окне 07:00-10:00 в target_date
+        if is_round_the_clock:
+            if entry_date_local == target_date:
+                entry_time_local = entry_local.time()
+                if time(7, 0) <= entry_time_local <= time(10, 0):
+                    existing = ee
+                    break
+        else:
+            if entry_date_local == target_date:
+                existing = ee
+                break
+    
+    # Если нашли существующую запись
+    if existing:
+        entry_local = timezone.localtime(existing.entry_time)
+        actual_entry_time = entry_local.time()
+        actual_entry_date = entry_local.date()
+        
+        # Проверяем, нужно ли исправить запись
+        needs_fix = False
+        
+        if existing.exit_time is None:
+            # Нет выхода - нужно добавить
+            needs_fix = True
+        elif is_round_the_clock:
+            # Для круглосуточных графиков проверяем продолжительность
+            exit_local = timezone.localtime(existing.exit_time)
+            duration_seconds = int((exit_local - entry_local).total_seconds())
+            duration_hours = duration_seconds / 3600
+            
+            # Если продолжительность меньше 20 часов - это неправильно для круглосуточного графика
+            if duration_hours < 20:
+                needs_fix = True
+                logger.info(
+                    f"Найдена запись с неправильной продолжительностью для {employee.name} на {target_date}: "
+                    f"{duration_hours:.1f}ч (ожидается ~24ч)"
+                )
+        
+        if needs_fix:
+            # Исправляем запись
+            if is_round_the_clock:
+                # Для круглосуточных: выход на следующий день примерно в то же время, что и вход
+                exit_date = actual_entry_date + timedelta(days=1)
+                # Используем время входа для выхода (или немного позже, если нужно)
+                exit_time_to_use = actual_entry_time
+                # Если время входа очень раннее (до 7:00), используем 8:00 для выхода
+                if actual_entry_time < time(7, 0):
+                    exit_time_to_use = time(8, 0)
+                elif actual_entry_time > time(10, 0):
+                    # Если вход после 10:00, используем то же время для выхода
+                    exit_time_to_use = actual_entry_time
+            else:
+                # Для обычных графиков используем логику из графика
+                if entry_time is None or exit_time is None or entry_date_offset is None or exit_date_offset is None:
+                    default_entry, default_exit, default_entry_offset, default_exit_offset = get_default_times_for_employee(employee)
+                    if entry_time is None:
+                        entry_time = default_entry
+                    if exit_time is None:
+                        exit_time = default_exit
+                    if entry_date_offset is None:
+                        entry_date_offset = default_entry_offset
+                    if exit_date_offset is None:
+                        exit_date_offset = default_exit_offset
+                
+                exit_date = target_date + timedelta(days=exit_date_offset)
+                exit_time_to_use = exit_time
+            
+            exit_datetime = timezone.make_aware(datetime.combine(exit_date, exit_time_to_use))
+            
+            existing.exit_time = exit_datetime
+            existing.work_duration_seconds = int((exit_datetime - existing.entry_time).total_seconds())
+            existing.save()
+            
+            logger.info(
+                f"Исправлена запись для {employee.name} на {target_date}: "
+                f"вход {entry_local.strftime('%Y-%m-%d %H:%M:%S')}, "
+                f"выход {exit_datetime.strftime('%Y-%m-%d %H:%M:%S')}, "
+                f"продолжительность {existing.work_duration_seconds // 3600}ч {(existing.work_duration_seconds % 3600) // 60}м"
+            )
+            return existing, False
+        else:
+            logger.info(f"Запись для {employee.name} на {target_date} уже существует и корректна")
+            return existing, False
+    
+    # Если записи нет, создаем новую
     # Если время не указано, определяем автоматически
     if entry_time is None or exit_time is None or entry_date_offset is None or exit_date_offset is None:
         default_entry, default_exit, default_entry_offset, default_exit_offset = get_default_times_for_employee(employee)
@@ -303,24 +448,6 @@ def create_entry_exit_for_date(
     exit_date = target_date + timedelta(days=exit_date_offset)
     exit_datetime = timezone.make_aware(datetime.combine(exit_date, exit_time))
     
-    # Проверяем, не существует ли уже запись
-    existing = EntryExit.objects.filter(
-        hikvision_id=employee.hikvision_id,
-        entry_time__date=entry_date
-    ).first()
-    
-    if existing:
-        # Обновляем существующую запись, если она неполная
-        if existing.exit_time is None:
-            existing.exit_time = exit_datetime
-            existing.work_duration_seconds = int((exit_datetime - existing.entry_time).total_seconds())
-            existing.save()
-            logger.info(f"Обновлена неполная запись для {employee.name} на {target_date}")
-            return existing, False
-        else:
-            logger.info(f"Запись для {employee.name} на {target_date} уже существует и полная")
-            return existing, False
-    
     # Создаем новую запись
     duration_seconds = int((exit_datetime - entry_datetime).total_seconds())
     
@@ -333,7 +460,12 @@ def create_entry_exit_for_date(
         device_name_exit='Автоматически создано'
     )
     
-    logger.info(f"Создана запись для {employee.name} на {target_date}: вход {entry_datetime}, выход {exit_datetime}")
+    logger.info(
+        f"Создана запись для {employee.name} на {target_date}: "
+        f"вход {entry_datetime.strftime('%Y-%m-%d %H:%M:%S')}, "
+        f"выход {exit_datetime.strftime('%Y-%m-%d %H:%M:%S')}, "
+        f"продолжительность {duration_seconds // 3600}ч {(duration_seconds % 3600) // 60}м"
+    )
     return entry_exit, True
 
 
@@ -362,6 +494,115 @@ def check_all_employees(start_date: date, end_date: date) -> List[Dict]:
             logger.error(f"Ошибка при проверке сотрудника {employee.name}: {e}")
     
     return results
+
+
+def fix_all_invalid_durations(start_date: date, end_date: date) -> Dict:
+    """
+    Исправляет все записи с неправильной продолжительностью для круглосуточных графиков.
+    
+    Args:
+        start_date: Начальная дата для проверки
+        end_date: Конечная дата для проверки
+        
+    Returns:
+        Словарь со статистикой исправлений
+    """
+    logger.info(f"Исправление всех записей с неправильной продолжительностью за период {start_date} - {end_date}")
+    
+    fixed_count = 0
+    checked_count = 0
+    employees_processed = set()
+    
+    # Получаем всех сотрудников с круглосуточными графиками
+    employees_with_round_clock = Employee.objects.filter(
+        work_schedules__schedule_type='round_the_clock'
+    ).distinct().select_related('department').prefetch_related('work_schedules')
+    
+    print(f"\nПроверка {employees_with_round_clock.count()} сотрудников с круглосуточными графиками...")
+    
+    start_datetime = timezone.make_aware(datetime.combine(start_date, datetime.min.time()))
+    end_datetime = timezone.make_aware(datetime.combine(end_date + timedelta(days=1), datetime.min.time()))
+    
+    for employee in employees_with_round_clock:
+        try:
+            # Получаем все записи за период
+            entries = EntryExit.objects.filter(
+                hikvision_id=employee.hikvision_id,
+                entry_time__gte=start_datetime,
+                entry_time__lt=end_datetime,
+                exit_time__isnull=False
+            ).order_by('entry_time')
+            
+            for entry_exit in entries:
+                checked_count += 1
+                entry_local = timezone.localtime(entry_exit.entry_time)
+                exit_local = timezone.localtime(entry_exit.exit_time)
+                entry_date = entry_local.date()
+                entry_time_local = entry_local.time()
+                
+                # Проверяем только записи с входом в окне 07:00-10:00 (для круглосуточных графиков)
+                if not (time(7, 0) <= entry_time_local <= time(10, 0)):
+                    continue
+                
+                duration_seconds = int((exit_local - entry_local).total_seconds())
+                duration_hours = duration_seconds / 3600
+                
+                # Если продолжительность меньше 20 часов - исправляем
+                if duration_hours < 20:
+                    # Выход должен быть на следующий день примерно в то же время
+                    exit_date = entry_date + timedelta(days=1)
+                    exit_time_to_use = entry_time_local
+                    
+                    # Если время входа очень раннее (до 7:00), используем 8:00 для выхода
+                    if entry_time_local < time(7, 0):
+                        exit_time_to_use = time(8, 0)
+                    
+                    new_exit_datetime = timezone.make_aware(datetime.combine(exit_date, exit_time_to_use))
+                    new_duration_seconds = int((new_exit_datetime - entry_exit.entry_time).total_seconds())
+                    
+                    entry_exit.exit_time = new_exit_datetime
+                    entry_exit.work_duration_seconds = new_duration_seconds
+                    entry_exit.save()
+                    
+                    fixed_count += 1
+                    employees_processed.add(employee.name)
+                    
+                    new_duration_hours = new_duration_seconds // 3600
+                    new_duration_mins = (new_duration_seconds % 3600) // 60
+                    
+                    logger.info(
+                        f"Исправлена запись для {employee.name} на {entry_date}: "
+                        f"было {duration_hours:.1f}ч, стало {new_duration_hours}ч {new_duration_mins}м"
+                    )
+                    
+                    if fixed_count % 10 == 0:
+                        print(f"  Исправлено записей: {fixed_count}...")
+        
+        except Exception as e:
+            logger.error(f"Ошибка при обработке сотрудника {employee.name}: {e}")
+    
+    print(f"\nИтоги исправления:")
+    print(f"  Проверено записей: {checked_count}")
+    print(f"  Исправлено записей: {fixed_count}")
+    print(f"  Затронуто сотрудников: {len(employees_processed)}")
+    
+    if employees_processed:
+        print(f"\n  Сотрудники с исправленными записями:")
+        for name in sorted(employees_processed)[:20]:
+            print(f"    - {name}")
+        if len(employees_processed) > 20:
+            print(f"    ... и еще {len(employees_processed) - 20} сотрудников")
+    
+    logger.info(
+        f"Итоги исправления: проверено {checked_count}, исправлено {fixed_count}, "
+        f"затронуто сотрудников {len(employees_processed)}"
+    )
+    
+    return {
+        'checked': checked_count,
+        'fixed': fixed_count,
+        'employees_affected': len(employees_processed)
+    }
 
 
 def create_missing_records(year: int = 2025, month: int = 12):
@@ -406,10 +647,18 @@ def create_missing_records(year: int = 2025, month: int = 12):
                 
                 if created:
                     created_count += 1
-                    print(f"    ✓ Создана запись на {target_date}")
+                    entry_local = timezone.localtime(entry_exit.entry_time)
+                    exit_local = timezone.localtime(entry_exit.exit_time)
+                    duration_hours = entry_exit.work_duration_seconds // 3600
+                    duration_mins = (entry_exit.work_duration_seconds % 3600) // 60
+                    print(f"    ✓ Создана запись на {target_date}: {duration_hours}ч {duration_mins}м")
                 else:
                     updated_count += 1
-                    print(f"    → Обновлена запись на {target_date}")
+                    entry_local = timezone.localtime(entry_exit.entry_time)
+                    exit_local = timezone.localtime(entry_exit.exit_time)
+                    duration_hours = entry_exit.work_duration_seconds // 3600 if entry_exit.work_duration_seconds else 0
+                    duration_mins = ((entry_exit.work_duration_seconds % 3600) // 60) if entry_exit.work_duration_seconds else 0
+                    print(f"    → Исправлена запись на {target_date}: {duration_hours}ч {duration_mins}м")
                     
             except Exception as e:
                 logger.error(f"Ошибка при создании записи для {employee.name} на {target_date}: {e}")
@@ -471,6 +720,11 @@ def main():
         '--export',
         type=str,
         help='Экспортировать результаты проверки в файл (путь к файлу)'
+    )
+    parser.add_argument(
+        '--fix-all-durations',
+        action='store_true',
+        help='Исправить все записи с неправильной продолжительностью для всех сотрудников'
     )
     
     args = parser.parse_args()
@@ -540,10 +794,21 @@ def main():
         else:
             print("\n✓ Все сотрудники имеют полные графики")
     
+    # Исправление всех записей с неправильной продолжительностью
+    # Запускается автоматически, если не указан --check-only
+    if not args.check_only or args.fix_all_durations:
+        print("\n" + "=" * 80)
+        print("2. ИСПРАВЛЕНИЕ ВСЕХ ЗАПИСЕЙ С НЕПРАВИЛЬНОЙ ПРОДОЛЖИТЕЛЬНОСТЬЮ")
+        print("-" * 80)
+        fix_stats = fix_all_invalid_durations(start_date, end_date)
+        print(f"\nПроверено записей: {fix_stats['checked']}")
+        print(f"Исправлено записей: {fix_stats['fixed']}")
+        print(f"Затронуто сотрудников: {fix_stats['employees_affected']}")
+    
     # Создание недостающих записей
     if not args.check_only:
         print("\n" + "=" * 80)
-        print("2. СОЗДАНИЕ НЕДОСТАЮЩИХ ЗАПИСЕЙ")
+        print("3. СОЗДАНИЕ НЕДОСТАЮЩИХ ЗАПИСЕЙ")
         print("-" * 80)
         stats = create_missing_records(year=start_date.year, month=start_date.month)
         print(f"\nСоздано новых записей: {stats['created']}")

@@ -37,6 +37,7 @@ services:
     # For development, uncomment: - .:/app
     volumes:
       - static_volume:/app/staticfiles
+      - .:/app  # Раскомментировано для синхронизации файлов при разработке
     ports:
       - "0.0.0.0:8000:8000"  # Bind to all interfaces for network access
     environment:
