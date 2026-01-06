@@ -646,65 +646,44 @@ def remove_records_without_shift(start_date: date, end_date: date) -> Dict:
                 entry_time__lt=end_datetime
             ).order_by('entry_time')
             
-            # Группируем записи по дате входа
-            entries_by_date = {}
+            # Проверяем каждую запись отдельно
+            # Если продолжительность меньше 20 часов - это не смена (нет "24" в табеле) - удаляем
             for entry_exit in entries:
+                checked_count += 1
                 entry_local = timezone.localtime(entry_exit.entry_time)
                 entry_date = entry_local.date()
                 
-                if entry_date not in entries_by_date:
-                    entries_by_date[entry_date] = []
-                entries_by_date[entry_date].append(entry_exit)
-            
-            # Проверяем каждую дату
-            for entry_date, date_entries in entries_by_date.items():
-                checked_count += len(date_entries)
+                # Пропускаем записи без выхода
+                if not entry_exit.exit_time:
+                    continue
                 
-                # Проверяем, есть ли хотя бы одна запись с продолжительностью 20-30 часов (смена = "24" в табеле)
-                has_valid_shift = False
-                max_duration_hours = 0
+                # Вычисляем продолжительность
+                duration_hours = 0
+                if entry_exit.work_duration_seconds:
+                    duration_hours = entry_exit.work_duration_seconds / 3600
+                else:
+                    exit_local = timezone.localtime(entry_exit.exit_time)
+                    duration_seconds = int((exit_local - entry_local).total_seconds())
+                    duration_hours = duration_seconds / 3600
                 
-                for entry_exit in date_entries:
-                    duration_hours = 0
+                # Если продолжительность меньше 20 часов - это не смена (нет "24" в табеле)
+                # Удаляем запись
+                if duration_hours < 20:
+                    entry_exit.delete()
+                    removed_count += 1
+                    employees_processed.add(employee.name)
                     
-                    # Проверяем work_duration_seconds
-                    if entry_exit.exit_time and entry_exit.work_duration_seconds:
-                        duration_hours = entry_exit.work_duration_seconds / 3600
-                    # Если нет work_duration_seconds, проверяем вручную
-                    elif entry_exit.exit_time:
-                        entry_local = timezone.localtime(entry_exit.entry_time)
-                        exit_local = timezone.localtime(entry_exit.exit_time)
-                        duration_seconds = int((exit_local - entry_local).total_seconds())
-                        duration_hours = duration_seconds / 3600
+                    # Статистика по датам
+                    date_key = f"{entry_date}"
+                    if date_key not in dates_removed:
+                        dates_removed[date_key] = 0
+                    dates_removed[date_key] += 1
                     
-                    if duration_hours > max_duration_hours:
-                        max_duration_hours = duration_hours
-                    
-                    # Если продолжительность 20-30 часов - это смена ("24" в табеле)
-                    if 20 <= duration_hours <= 30:
-                        has_valid_shift = True
-                        break
-                
-                # Если нет смены (20-30 часов) - удаляем все записи за этот день
-                # Это означает, что в табеле пусто (нет "24")
-                if not has_valid_shift:
-                    for entry_exit in date_entries:
-                        entry_local = timezone.localtime(entry_exit.entry_time)
-                        entry_exit.delete()
-                        removed_count += 1
-                        employees_processed.add(employee.name)
-                        
-                        # Статистика по датам
-                        date_key = f"{entry_date}"
-                        if date_key not in dates_removed:
-                            dates_removed[date_key] = 0
-                        dates_removed[date_key] += 1
-                        
-                        logger.info(
-                            f"Удалена запись без смены для {employee.name} на {entry_date}: "
-                            f"вход {entry_local.strftime('%Y-%m-%d %H:%M:%S')}, "
-                            f"продолжительность {max_duration_hours:.1f}ч (нет '24' в табеле)"
-                        )
+                    logger.info(
+                        f"Удалена запись без смены для {employee.name} на {entry_date}: "
+                        f"вход {entry_local.strftime('%Y-%m-%d %H:%M:%S')}, "
+                        f"продолжительность {duration_hours:.1f}ч (нет '24' в табеле, меньше 20 часов)"
+                    )
                     
                     if removed_count % 10 == 0:
                         print(f"  Удалено записей: {removed_count}...")
