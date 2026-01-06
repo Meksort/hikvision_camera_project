@@ -119,23 +119,61 @@ def process_single_camera_event(camera_event):
         
         elif is_exit:
             # Событие выхода - обновляем существующую запись EntryExit
-            # Ищем запись входа без выхода за этот день или предыдущий день (для ночных смен)
+            # Ищем запись входа без выхода за этот день, предыдущий день или позавчера (для круглосуточных графиков)
             yesterday = event_date - timedelta(days=1)
+            day_before_yesterday = event_date - timedelta(days=2)
             
-            # Сначала ищем за сегодня
-            existing = EntryExit.objects.filter(
-                hikvision_id=clean_employee_id,
-                entry_time__date=event_date,
-                exit_time__isnull=True
-            ).order_by('-entry_time').first()
+            # Проверяем, есть ли у сотрудника круглосуточный график
+            from .models import Employee
+            employee = Employee.objects.filter(hikvision_id=clean_employee_id).first()
+            is_round_the_clock = False
+            if employee:
+                schedule = employee.work_schedules.first()
+                if schedule and schedule.schedule_type == 'round_the_clock':
+                    is_round_the_clock = True
             
-            # Если не нашли за сегодня, ищем за вчера (для ночных смен)
-            if not existing:
+            # Для круглосуточных графиков: приоритетно ищем вход за вчера (выход должен быть на следующий день)
+            # Для обычных графиков: сначала ищем за сегодня
+            existing = None
+            
+            if is_round_the_clock:
+                # Для круглосуточных графиков сначала ищем за вчера (выход на следующий день после входа)
                 existing = EntryExit.objects.filter(
                     hikvision_id=clean_employee_id,
                     entry_time__date=yesterday,
                     exit_time__isnull=True
                 ).order_by('-entry_time').first()
+                
+                # Если не нашли за вчера, ищем за позавчера
+                if not existing:
+                    existing = EntryExit.objects.filter(
+                        hikvision_id=clean_employee_id,
+                        entry_time__date=day_before_yesterday,
+                        exit_time__isnull=True
+                    ).order_by('-entry_time').first()
+                
+                # В последнюю очередь ищем за сегодня (на случай, если это не круглосуточный график)
+                if not existing:
+                    existing = EntryExit.objects.filter(
+                        hikvision_id=clean_employee_id,
+                        entry_time__date=event_date,
+                        exit_time__isnull=True
+                    ).order_by('-entry_time').first()
+            else:
+                # Для обычных графиков: сначала ищем за сегодня
+                existing = EntryExit.objects.filter(
+                    hikvision_id=clean_employee_id,
+                    entry_time__date=event_date,
+                    exit_time__isnull=True
+                ).order_by('-entry_time').first()
+                
+                # Если не нашли за сегодня, ищем за вчера (для ночных смен)
+                if not existing:
+                    existing = EntryExit.objects.filter(
+                        hikvision_id=clean_employee_id,
+                        entry_time__date=yesterday,
+                        exit_time__isnull=True
+                    ).order_by('-entry_time').first()
             
             if existing:
                 # УЛУЧШЕННАЯ ЛОГИКА: Если есть вход (IP 124) и выход (IP 143), обязательно создаем полную запись
@@ -143,16 +181,19 @@ def process_single_camera_event(camera_event):
                 if event_time > existing.entry_time:
                     duration = event_time - existing.entry_time
                     hours_diff = duration.total_seconds() / 3600
-                    # УВЕЛИЧЕН диапазон: от 30 минут до 24 часов (для учета длинных смен и ночных смен)
-                    # Это гарантирует, что если есть вход (IP 124) и выход (IP 143), они будут сопоставлены
-                    if 0.5 <= hours_diff <= 24:
+                    
+                    # Для круглосуточных графиков: диапазон от 30 минут до 48 часов
+                    # Для обычных графиков: диапазон от 30 минут до 24 часов
+                    max_hours = 48 if is_round_the_clock else 24
+                    
+                    if 0.5 <= hours_diff <= max_hours:
                         existing.exit_time = event_time
                         existing.device_name_exit = camera_event.device_name
                         existing.work_duration_seconds = int(duration.total_seconds())
                         existing.save()
                         logger.info(f"Обновлена запись EntryExit (выход) для сотрудника {clean_employee_id} на {existing.entry_time.date()}, продолжительность: {hours_diff:.2f} часов")
                     else:
-                        logger.warning(f"Выход для сотрудника {clean_employee_id} отклонен: продолжительность {hours_diff:.2f} часов вне допустимого диапазона (0.5-24 часа)")
+                        logger.warning(f"Выход для сотрудника {clean_employee_id} отклонен: продолжительность {hours_diff:.2f} часов вне допустимого диапазона (0.5-{max_hours} часа)")
             else:
                 # Если нет записи входа, создаем запись только с выходом (неполная запись)
                 EntryExit.objects.create(

@@ -384,16 +384,55 @@ def create_entry_exit_for_date(
         if needs_fix:
             # Исправляем запись
             if is_round_the_clock:
-                # Для круглосуточных: выход на следующий день примерно в то же время, что и вход
-                exit_date = actual_entry_date + timedelta(days=1)
-                # Используем время входа для выхода (или немного позже, если нужно)
-                exit_time_to_use = actual_entry_time
-                # Если время входа очень раннее (до 7:00), используем 8:00 для выхода
-                if actual_entry_time < time(7, 0):
-                    exit_time_to_use = time(8, 0)
-                elif actual_entry_time > time(10, 0):
-                    # Если вход после 10:00, используем то же время для выхода
+                # Для круглосуточных: ищем реальный выход на следующий день в базе данных
+                next_day = actual_entry_date + timedelta(days=1)
+                next_day_start = timezone.make_aware(datetime.combine(next_day, datetime.min.time()))
+                next_day_end = timezone.make_aware(datetime.combine(next_day + timedelta(days=1), datetime.min.time()))
+                
+                # Ищем записи с выходом на следующий день
+                next_day_exits = EntryExit.objects.filter(
+                    hikvision_id=employee.hikvision_id,
+                    exit_time__gte=next_day_start,
+                    exit_time__lt=next_day_end
+                ).order_by('exit_time')
+                
+                # Ищем записи с входом на следующий день (может быть выход предыдущей смены)
+                next_day_entries = EntryExit.objects.filter(
+                    hikvision_id=employee.hikvision_id,
+                    entry_time__gte=next_day_start,
+                    entry_time__lt=next_day_end
+                ).order_by('entry_time')
+                
+                found_real_exit = False
+                exit_datetime = None
+                
+                # Приоритет 1: Выход на следующий день
+                if next_day_exits.exists():
+                    real_exit = next_day_exits.first()
+                    exit_local = timezone.localtime(real_exit.exit_time)
+                    exit_time_local = exit_local.time()
+                    if time(6, 0) <= exit_time_local <= time(12, 0):
+                        exit_datetime = real_exit.exit_time
+                        found_real_exit = True
+                
+                # Приоритет 2: Вход на следующий день в окне 07:00-10:00
+                if not found_real_exit and next_day_entries.exists():
+                    real_entry = next_day_entries.first()
+                    entry_local = timezone.localtime(real_entry.entry_time)
+                    entry_time_local = entry_local.time()
+                    if time(7, 0) <= entry_time_local <= time(10, 0):
+                        exit_datetime = real_entry.entry_time
+                        found_real_exit = True
+                
+                # Если не нашли реальный выход, используем примерное время
+                if not found_real_exit:
+                    exit_date = actual_entry_date + timedelta(days=1)
                     exit_time_to_use = actual_entry_time
+                    if actual_entry_time < time(7, 0):
+                        exit_time_to_use = time(8, 0)
+                    elif actual_entry_time > time(10, 0):
+                        exit_time_to_use = actual_entry_time
+                    exit_datetime = timezone.make_aware(datetime.combine(exit_date, exit_time_to_use))
             else:
                 # Для обычных графиков используем логику из графика
                 if entry_time is None or exit_time is None or entry_date_offset is None or exit_date_offset is None:
@@ -538,45 +577,174 @@ def fix_all_invalid_durations(start_date: date, end_date: date) -> Dict:
                 entry_local = timezone.localtime(entry_exit.entry_time)
                 exit_local = timezone.localtime(entry_exit.exit_time)
                 entry_date = entry_local.date()
+                exit_date = exit_local.date()
                 entry_time_local = entry_local.time()
                 
-                # Проверяем только записи с входом в окне 07:00-10:00 (для круглосуточных графиков)
-                if not (time(7, 0) <= entry_time_local <= time(10, 0)):
-                    continue
+                # Для круглосуточных графиков проверяем все записи
+                # Приоритет: записи с входом в окне 07:00-10:00, но исправляем и другие
                 
                 duration_seconds = int((exit_local - entry_local).total_seconds())
                 duration_hours = duration_seconds / 3600
                 
-                # Если продолжительность меньше 20 часов - исправляем
+                # Проверяем, нужно ли исправить запись:
+                # 1. Продолжительность меньше 20 часов - неправильно для круглосуточного графика
+                # 2. Выход в тот же день, что и вход, и продолжительность < 20 часов - неправильно
+                needs_fix = False
+                
                 if duration_hours < 20:
-                    # Выход должен быть на следующий день примерно в то же время
-                    exit_date = entry_date + timedelta(days=1)
+                    needs_fix = True
+                elif exit_date == entry_date:
+                    # Выход в тот же день для круглосуточного графика - неправильно
+                    # (кроме случаев, когда продолжительность > 20 часов - это может быть нормально)
+                    if duration_hours < 20:
+                        needs_fix = True
+                
+                if not needs_fix:
+                    continue
+                
+                # Ищем реальный выход на следующий день в базе данных
+                next_day = entry_date + timedelta(days=1)
+                next_day_start = timezone.make_aware(datetime.combine(next_day, datetime.min.time()))
+                next_day_end = timezone.make_aware(datetime.combine(next_day + timedelta(days=1), datetime.min.time()))
+                
+                # Ищем записи с выходом на следующий день
+                # Вариант 1: Ищем другие записи EntryExit с exit_time на следующий день
+                next_day_exits = EntryExit.objects.filter(
+                    hikvision_id=employee.hikvision_id,
+                    exit_time__gte=next_day_start,
+                    exit_time__lt=next_day_end
+                ).order_by('exit_time')
+                
+                # Вариант 2: Ищем записи с входом на следующий день (это может быть выход предыдущей смены)
+                # Для круглосуточных графиков вход на следующий день часто означает выход предыдущей смены
+                next_day_entries = EntryExit.objects.filter(
+                    hikvision_id=employee.hikvision_id,
+                    entry_time__gte=next_day_start,
+                    entry_time__lt=next_day_end
+                ).order_by('entry_time')
+                
+                # Вариант 3: Ищем события CameraEvent выхода на следующий день (если EntryExit еще не созданы)
+                from camera_events.models import CameraEvent
+                next_day_camera_exits = CameraEvent.objects.filter(
+                    hikvision_id=employee.hikvision_id,
+                    event_time__gte=next_day_start,
+                    event_time__lt=next_day_end
+                ).order_by('event_time')
+                
+                # Определяем, какие события являются выходами (по IP или device_name)
+                camera_exit_events = []
+                for cam_event in next_day_camera_exits:
+                    is_exit_event = False
+                    # Проверяем IP адрес
+                    if cam_event.raw_data and isinstance(cam_event.raw_data, dict):
+                        outer_event = cam_event.raw_data.get("AccessControllerEvent", {})
+                        if isinstance(outer_event, dict):
+                            camera_ip = (
+                                outer_event.get("ipAddress") or
+                                outer_event.get("remoteHostAddr") or
+                                outer_event.get("ip") or
+                                None
+                            )
+                            if camera_ip:
+                                camera_ip_str = str(camera_ip)
+                                # ВЫХОД: IP содержит 143
+                                if "192.168.1.143" in camera_ip_str or camera_ip_str.endswith(".143") or camera_ip_str == "143":
+                                    is_exit_event = True
+                    
+                    # Проверяем device_name
+                    if not is_exit_event:
+                        device_name_lower = (cam_event.device_name or "").lower()
+                        is_exit_event = any(word in device_name_lower for word in ['выход', 'exit', 'выходная', 'выход 1', 'выход1', '143'])
+                    
+                    if is_exit_event:
+                        camera_exit_events.append(cam_event)
+                
+                # Используем реальный выход, если найден
+                found_real_exit = False
+                new_exit_datetime = None
+                
+                # Приоритет 1: Выход на следующий день из других записей EntryExit
+                if next_day_exits.exists():
+                    # Берем самый ранний выход на следующий день
+                    real_exit = next_day_exits.first()
+                    exit_local = timezone.localtime(real_exit.exit_time)
+                    # Проверяем, что это разумное время (не слишком рано и не слишком поздно)
+                    exit_time_local = exit_local.time()
+                    if time(6, 0) <= exit_time_local <= time(12, 0):
+                        new_exit_datetime = real_exit.exit_time
+                        found_real_exit = True
+                        logger.info(
+                            f"Найден реальный выход (EntryExit) на следующий день для {employee.name} на {entry_date}: "
+                            f"{exit_local.strftime('%Y-%m-%d %H:%M:%S')}"
+                        )
+                
+                # Приоритет 2: События CameraEvent выхода на следующий день
+                if not found_real_exit and camera_exit_events:
+                    # Берем самое раннее событие выхода на следующий день
+                    real_exit_event = camera_exit_events[0]
+                    exit_local = timezone.localtime(real_exit_event.event_time)
+                    exit_time_local = exit_local.time()
+                    if time(6, 0) <= exit_time_local <= time(12, 0):
+                        new_exit_datetime = real_exit_event.event_time
+                        found_real_exit = True
+                        logger.info(
+                            f"Найден реальный выход (CameraEvent) на следующий день для {employee.name} на {entry_date}: "
+                            f"{exit_local.strftime('%Y-%m-%d %H:%M:%S')}"
+                        )
+                
+                # Приоритет 3: Вход на следующий день (для круглосуточных графиков вход часто означает конец предыдущей смены)
+                if not found_real_exit and next_day_entries.exists():
+                    # Берем самый ранний вход на следующий день
+                    real_entry = next_day_entries.first()
+                    entry_local = timezone.localtime(real_entry.entry_time)
+                    entry_time_local = entry_local.time()
+                    # Для круглосуточных графиков вход на следующий день в окне 07:00-10:00 может быть выходом предыдущей смены
+                    if time(7, 0) <= entry_time_local <= time(10, 0):
+                        # Используем время входа как время выхода предыдущей смены
+                        new_exit_datetime = real_entry.entry_time
+                        found_real_exit = True
+                        logger.info(
+                            f"Использован вход на следующий день как выход для {employee.name} на {entry_date}: "
+                            f"{entry_local.strftime('%Y-%m-%d %H:%M:%S')}"
+                        )
+                
+                # Если не нашли реальный выход, используем примерное время
+                if not found_real_exit:
+                    new_exit_date = entry_date + timedelta(days=1)
                     exit_time_to_use = entry_time_local
                     
                     # Если время входа очень раннее (до 7:00), используем 8:00 для выхода
                     if entry_time_local < time(7, 0):
                         exit_time_to_use = time(8, 0)
+                    # Если время входа после 10:00, используем то же время для выхода
+                    elif entry_time_local > time(10, 0):
+                        exit_time_to_use = entry_time_local
                     
-                    new_exit_datetime = timezone.make_aware(datetime.combine(exit_date, exit_time_to_use))
-                    new_duration_seconds = int((new_exit_datetime - entry_exit.entry_time).total_seconds())
-                    
-                    entry_exit.exit_time = new_exit_datetime
-                    entry_exit.work_duration_seconds = new_duration_seconds
-                    entry_exit.save()
-                    
-                    fixed_count += 1
-                    employees_processed.add(employee.name)
-                    
-                    new_duration_hours = new_duration_seconds // 3600
-                    new_duration_mins = (new_duration_seconds % 3600) // 60
-                    
+                    new_exit_datetime = timezone.make_aware(datetime.combine(new_exit_date, exit_time_to_use))
                     logger.info(
-                        f"Исправлена запись для {employee.name} на {entry_date}: "
-                        f"было {duration_hours:.1f}ч, стало {new_duration_hours}ч {new_duration_mins}м"
+                        f"Использовано примерное время выхода для {employee.name} на {entry_date}: "
+                        f"{timezone.localtime(new_exit_datetime).strftime('%Y-%m-%d %H:%M:%S')}"
                     )
-                    
-                    if fixed_count % 10 == 0:
-                        print(f"  Исправлено записей: {fixed_count}...")
+                
+                new_duration_seconds = int((new_exit_datetime - entry_exit.entry_time).total_seconds())
+                
+                entry_exit.exit_time = new_exit_datetime
+                entry_exit.work_duration_seconds = new_duration_seconds
+                entry_exit.save()
+                
+                fixed_count += 1
+                employees_processed.add(employee.name)
+                
+                new_duration_hours = new_duration_seconds // 3600
+                new_duration_mins = (new_duration_seconds % 3600) // 60
+                
+                logger.info(
+                    f"Исправлена запись для {employee.name} на {entry_date}: "
+                    f"было {duration_hours:.1f}ч, стало {new_duration_hours}ч {new_duration_mins}м"
+                )
+                
+                if fixed_count % 10 == 0:
+                    print(f"  Исправлено записей: {fixed_count}...")
         
         except Exception as e:
             logger.error(f"Ошибка при обработке сотрудника {employee.name}: {e}")
