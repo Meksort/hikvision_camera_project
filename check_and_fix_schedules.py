@@ -123,6 +123,60 @@ def find_employee_by_name(name_part: str, department_hint: str = '') -> Optional
         return None
 
 
+def has_shift_on_date(employee: Employee, check_date: date) -> bool:
+    """
+    Проверяет, была ли смена (24 часа работы) в указанный день.
+    "24" в табеле = была смена = есть запись EntryExit с продолжительностью около 20-30 часов.
+    
+    Args:
+        employee: Сотрудник
+        check_date: Дата для проверки
+        
+    Returns:
+        True, если была смена (24 часа), False если выходной
+    """
+    start_datetime = timezone.make_aware(datetime.combine(check_date, datetime.min.time()))
+    end_datetime = timezone.make_aware(datetime.combine(check_date + timedelta(days=1), datetime.min.time()))
+    
+    # Ищем записи с входом в этот день
+    entries = EntryExit.objects.filter(
+        hikvision_id=employee.hikvision_id,
+        entry_time__gte=start_datetime,
+        entry_time__lt=end_datetime,
+        exit_time__isnull=False
+    )
+    
+    # Проверяем, есть ли запись с продолжительностью около 20-30 часов (смена = 24 в табеле)
+    for entry in entries:
+        if entry.work_duration_seconds:
+            duration_hours = entry.work_duration_seconds / 3600
+            # Если продолжительность 20-30 часов - это смена (24 в табеле)
+            if 20 <= duration_hours <= 30:
+                return True  # Была смена
+    
+    # Если нет записей с продолжительностью 20-30 часов, проверяем выход на следующий день
+    next_day = check_date + timedelta(days=1)
+    next_day_start = timezone.make_aware(datetime.combine(next_day, datetime.min.time()))
+    next_day_end = timezone.make_aware(datetime.combine(next_day + timedelta(days=1), datetime.min.time()))
+    
+    next_day_exits = EntryExit.objects.filter(
+        hikvision_id=employee.hikvision_id,
+        exit_time__gte=next_day_start,
+        exit_time__lt=next_day_end
+    )
+    
+    # Проверяем продолжительность от входа до выхода на следующий день
+    for entry in entries:
+        for exit_entry in next_day_exits:
+            if exit_entry.entry_time and entry.entry_time:
+                duration = exit_entry.exit_time - entry.entry_time
+                duration_hours = duration.total_seconds() / 3600
+                if 20 <= duration_hours <= 30:
+                    return True  # Была смена
+    
+    return False  # Нет смены - выходной
+
+
 def check_employee_schedule(employee: Employee, start_date: date, end_date: date) -> Dict:
     """
     Проверяет график работы сотрудника за указанный период.
@@ -190,6 +244,10 @@ def check_employee_schedule(employee: Employee, start_date: date, end_date: date
         schedule = employee.work_schedules.first()
         is_round_the_clock = schedule and schedule.schedule_type == 'round_the_clock'
         
+        # Проверяем, была ли смена (24 часа) в этот день
+        # "24" в табеле = была смена = есть запись с продолжительностью 20-30 часов
+        had_shift = has_shift_on_date(employee, current_date)
+        
         # Проверяем качество записей
         has_valid_entry = False
         has_invalid_duration = False
@@ -207,8 +265,8 @@ def check_employee_schedule(employee: Employee, start_date: date, end_date: date
                         duration_seconds = int((exit_local - entry_local).total_seconds())
                         duration_hours = duration_seconds / 3600
                         
-                        # Для круглосуточных графиков продолжительность должна быть около 20-26 часов
-                        if duration_hours >= 20:
+                        # Для круглосуточных графиков продолжительность должна быть около 20-30 часов (смена)
+                        if 20 <= duration_hours <= 30:
                             has_valid_entry = True
                         else:
                             has_invalid_duration = True
@@ -227,7 +285,12 @@ def check_employee_schedule(employee: Employee, start_date: date, end_date: date
         if has_exit:
             result['days_with_exit'] += 1
         
-        if has_valid_entry:
+        # Для круглосуточных графиков: если в табеле "24" (была смена), но нет записи - это проблема
+        if is_round_the_clock and had_shift and not has_valid_entry:
+            # В табеле была смена, но в базе нет правильной записи
+            result['days_incomplete'] += 1
+            result['incomplete_dates'].append(current_date)
+        elif has_valid_entry:
             result['days_complete'] += 1
         elif has_invalid_duration:
             # Есть запись, но с неправильной продолжительностью
@@ -239,8 +302,13 @@ def check_employee_schedule(employee: Employee, start_date: date, end_date: date
             result['incomplete_dates'].append(current_date)
         elif not has_entry and not has_exit:
             # Нет ни входа, ни выхода
-            result['days_empty'] += 1
-            result['empty_dates'].append(current_date)
+            # Если это не выходной по графику, отмечаем как пустой день
+            if is_round_the_clock and not had_shift:
+                # Выходной - это нормально
+                pass
+            else:
+                result['days_empty'] += 1
+                result['empty_dates'].append(current_date)
         
         current_date += timedelta(days=1)
     

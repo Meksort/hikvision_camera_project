@@ -31,18 +31,81 @@ def is_round_the_clock_morning_entry(dt: datetime) -> bool:
     return True
 
 
-def is_work_day_for_schedule(schedule: WorkSchedule, check_date: date) -> bool:
+def is_work_day_for_schedule(schedule: WorkSchedule, check_date: date, employee: Employee = None) -> bool:
     """
     Проверяет, является ли дата рабочим днем по графику.
+    Для круглосуточных графиков также проверяет фактические записи EntryExit,
+    чтобы определить, была ли смена (24 часа работы).
+    
+    Args:
+        schedule: График работы
+        check_date: Дата для проверки
+        employee: Сотрудник (опционально, для проверки фактических записей)
+    
+    Returns:
+        True, если день рабочий, False если выходной
     """
     if schedule.schedule_type == 'round_the_clock':
-        # Для круглосуточных графиков проверяем days_of_week
+        # Для круглосуточных графиков проверяем:
+        # 1. График работы (days_of_week)
+        # 2. Фактические записи EntryExit - была ли смена (24 часа работы)
+        
+        # Сначала проверяем график
         if schedule.days_of_week:
             weekday = check_date.weekday()  # 0=понедельник, 6=воскресенье
-            return weekday in schedule.days_of_week
+            is_scheduled_work_day = weekday in schedule.days_of_week
         else:
-            # Если days_of_week не указано, все дни рабочие
-            return True
+            # Если days_of_week не указано, все дни могут быть рабочими
+            is_scheduled_work_day = True
+        
+        # Если есть сотрудник, проверяем фактические записи
+        # "24" в табеле = была смена = есть запись EntryExit с продолжительностью около 20-30 часов
+        if employee:
+            start_datetime = timezone.make_aware(datetime.combine(check_date, datetime.min.time()))
+            end_datetime = timezone.make_aware(datetime.combine(check_date + timedelta(days=1), datetime.min.time()))
+            
+            # Ищем записи с входом в этот день
+            entries = EntryExit.objects.filter(
+                hikvision_id=employee.hikvision_id,
+                entry_time__gte=start_datetime,
+                entry_time__lt=end_datetime,
+                exit_time__isnull=False
+            )
+            
+            # Проверяем, есть ли запись с продолжительностью около 20-30 часов (смена)
+            for entry in entries:
+                if entry.work_duration_seconds:
+                    duration_hours = entry.work_duration_seconds / 3600
+                    # Если продолжительность 20-30 часов - это смена (24 в табеле)
+                    if 20 <= duration_hours <= 30:
+                        return True  # Была смена - рабочий день
+            
+            # Если нет записей с продолжительностью 20-30 часов, но есть запись с входом,
+            # проверяем, может быть выход на следующий день
+            if entries.exists():
+                # Проверяем записи с выходом на следующий день
+                next_day = check_date + timedelta(days=1)
+                next_day_start = timezone.make_aware(datetime.combine(next_day, datetime.min.time()))
+                next_day_end = timezone.make_aware(datetime.combine(next_day + timedelta(days=1), datetime.min.time()))
+                
+                next_day_exits = EntryExit.objects.filter(
+                    hikvision_id=employee.hikvision_id,
+                    exit_time__gte=next_day_start,
+                    exit_time__lt=next_day_end
+                )
+                
+                # Если есть выход на следующий день, проверяем продолжительность
+                for entry in entries:
+                    for exit_entry in next_day_exits:
+                        if exit_entry.entry_time and entry.entry_time:
+                            duration = exit_entry.exit_time - entry.entry_time
+                            duration_hours = duration.total_seconds() / 3600
+                            if 20 <= duration_hours <= 30:
+                                return True  # Была смена - рабочий день
+        
+        # Если нет фактических записей, используем график
+        return is_scheduled_work_day
+        
     elif schedule.schedule_type == 'regular':
         # Для обычных графиков проверяем days_of_week
         if schedule.days_of_week:
@@ -315,11 +378,22 @@ def generate_comprehensive_attendance_report_python(
     for (hikvision_id, period_date), data in results_by_employee_period.items():
         try:
             # Проверяем, является ли день рабочим
+            # Для круглосуточных графиков: если нет смены (24 часа) - это выходной
             employee = Employee.objects.filter(hikvision_id=hikvision_id).first()
             if employee:
                 schedule = employee.work_schedules.first()
-                if schedule and not is_work_day_for_schedule(schedule, period_date):
-                    continue
+                if schedule:
+                    # Для круглосуточных графиков проверяем фактические записи
+                    # "24" в табеле = была смена = есть запись с продолжительностью 20-30 часов
+                    if schedule.schedule_type == 'round_the_clock':
+                        # Проверяем, была ли смена (24 часа работы)
+                        if not is_work_day_for_schedule(schedule, period_date, employee):
+                            # Нет смены - выходной, пропускаем
+                            continue
+                    else:
+                        # Для обычных графиков используем стандартную проверку
+                        if not is_work_day_for_schedule(schedule, period_date, employee):
+                            continue
             
             # Находим первый вход и последний выход
             if not data['entries'] or not data['exits']:
