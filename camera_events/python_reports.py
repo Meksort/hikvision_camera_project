@@ -17,14 +17,14 @@ logger = logging.getLogger(__name__)
 
 def is_round_the_clock_morning_entry(dt: datetime) -> bool:
     """
-    Проверяет, попадает ли время входа в утреннее окно 07:00–11:00
+    Проверяет, попадает ли время входа в утреннее окно 07:00–10:00
     для круглосуточного графика.
     """
     if timezone.is_naive(dt):
         dt = timezone.make_aware(dt)
     dt_local = timezone.localtime(dt)
     t = dt_local.time()
-    return time(7, 0) <= t <= time(11, 0)
+    return time(7, 0) <= t <= time(10, 0)
 
 
 def is_work_day_for_schedule(schedule: WorkSchedule, check_date: date) -> bool:
@@ -232,11 +232,11 @@ def generate_comprehensive_attendance_report_python(
             # Определяем период для входа/выхода
             if schedule.schedule_type == 'round_the_clock':
                 # Новая логика для круглосуточных графиков:
-                # - Берем только утренние входы в окне 07:00–11:00
+                # - Берем только утренние входы в окне 07:00–10:00
                 # - Период (дата графика) = календарная дата этого входа
                 # - Выход относится к тому же периоду, даже если он на следующий день
                 if not is_round_the_clock_morning_entry(entry_time):
-                    # Вход вне окна 07:00–11:00 в графике не учитываем
+                    # Вход вне окна 07:00–10:00 в графике не учитываем
                     continue
                 period_date = entry_local.date()
                 
@@ -325,11 +325,11 @@ def generate_comprehensive_attendance_report_python(
             # Находим первый вход и последний выход для этого периода
             if data['schedule_type'] == 'round_the_clock' and data['entries']:
                 # Для круглосуточных графиков:
-                # если есть входы в окне 07:00–11:00, берем самый ранний из них,
+                # если есть входы в окне 07:00–10:00, берем самый ранний из них,
                 # иначе берем самый ранний вход за день
                 morning_entries = [
                     e for e in data['entries']
-                    if time(7, 0) <= e.time() <= time(11, 0)
+                    if time(7, 0) <= e.time() <= time(10, 0)
                 ]
                 if morning_entries:
                     first_entry = min(morning_entries)

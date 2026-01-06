@@ -506,25 +506,25 @@ def generate_comprehensive_attendance_report_sql(
             SELECT 
                 hikvision_id,
                 period_date,
-                -- Среднее время входов между 7:00 и 12:00
+                -- Среднее время входов между 7:00 и 10:00
                 CASE 
                     WHEN COUNT(CASE 
                         WHEN EXTRACT(HOUR FROM entry_local) >= 7 
-                        AND EXTRACT(HOUR FROM entry_local) < 12 
+                        AND EXTRACT(HOUR FROM entry_local) <= 10 
                         THEN 1 END) > 0
                     THEN 
-                        -- Вычисляем среднее время входов между 7:00 и 12:00
+                        -- Вычисляем среднее время входов между 7:00 и 10:00
                         (DATE(period_date) + 
                          AVG(CASE 
                              WHEN EXTRACT(HOUR FROM entry_local) >= 7 
-                             AND EXTRACT(HOUR FROM entry_local) < 12 
+                             AND EXTRACT(HOUR FROM entry_local) <= 10 
                              THEN EXTRACT(EPOCH FROM (entry_local::time - '00:00:00'::time))
                              ELSE NULL
                          END) * INTERVAL '1 second'
                         )::timestamp
                     ELSE 
-                        -- Если нет входов в промежутке 7:00-12:00, используем среднее время (9:30)
-                        (DATE(period_date) + '09:30:00'::time)::timestamp
+                        -- Если нет входов в промежутке 7:00-10:00, используем среднее время (8:30)
+                        (DATE(period_date) + '08:30:00'::time)::timestamp
                 END as avg_entry_time
             FROM entry_exits_with_period
             WHERE schedule_type = 'round_the_clock'
@@ -533,7 +533,7 @@ def generate_comprehensive_attendance_report_sql(
         -- Агрегируем данные по сотруднику и дате
                 -- Логика для круглосуточных графиков:
                 -- Период D определяется как КАЛЕНДАРНАЯ дата входа.
-                -- Для периода D: берем первый вход в окне 07:00–11:00 (если есть)
+                -- Для периода D: берем первый вход в окне 07:00–10:00 (если есть)
                 -- и последний выход, относящийся к этому периоду (даже если он на следующий день).
         aggregated_data AS (
             SELECT 
@@ -547,7 +547,8 @@ def generate_comprehensive_attendance_report_sql(
                 eep.schedule_end_time,
                 eep.allowed_late_minutes,
                 eep.allowed_early_leave_minutes,
-                -- Для круглосуточных графиков: если есть входы в окне 07:00–11:00,
+                eep.schedule_days_of_week,
+                -- Для круглосуточных графиков: если есть входы в окне 07:00–10:00,
                 -- берем самый ранний из них, иначе берем самый ранний вход за день.
                 CASE 
                     WHEN eep.schedule_type = 'round_the_clock' THEN
@@ -555,7 +556,7 @@ def generate_comprehensive_attendance_report_sql(
                             MIN(
                                 CASE 
                                     WHEN EXTRACT(HOUR FROM eep.entry_local) >= 7 
-                                         AND EXTRACT(HOUR FROM eep.entry_local) <= 11
+                                         AND EXTRACT(HOUR FROM eep.entry_local) <= 10
                                     THEN eep.entry_local
                                     ELSE NULL
                                 END
@@ -591,7 +592,7 @@ def generate_comprehensive_attendance_report_sql(
                                 MIN(
                                     CASE 
                                         WHEN EXTRACT(HOUR FROM eep.entry_local) >= 7 
-                                             AND EXTRACT(HOUR FROM eep.entry_local) <= 11
+                                             AND EXTRACT(HOUR FROM eep.entry_local) <= 10
                                         THEN eep.entry_local
                                         ELSE NULL
                                     END
@@ -699,6 +700,7 @@ def generate_comprehensive_attendance_report_sql(
                 eep.hikvision_id, eep.employee_name, eep.department_name, eep.period_date,
                 eep.schedule_type, eep.schedule_start_time, eep.schedule_end_time,
                 eep.allowed_late_minutes, eep.allowed_early_leave_minutes,
+                eep.schedule_days_of_week,
                 rtc.avg_entry_time
         )
         SELECT 
@@ -712,6 +714,7 @@ def generate_comprehensive_attendance_report_sql(
             schedule_end_time,
             allowed_late_minutes,
             allowed_early_leave_minutes,
+            schedule_days_of_week,
             first_entry,
             last_exit,
             total_duration_seconds,
@@ -724,15 +727,72 @@ def generate_comprehensive_attendance_report_sql(
         """
         
         logger.info(f"Executing comprehensive SQL query with {len(params)} parameters")
-        cursor.execute(query, params)
+        try:
+            cursor.execute(query, params)
+        except Exception as e:
+            logger.error(f"SQL query execution error: {e}")
+            logger.error(f"Query: {query[:1000]}...")  # Логируем первые 1000 символов запроса
+            raise
         
         # Получаем результаты
-        columns = [col[0] for col in cursor.description]
-        results = []
+        try:
+            columns = [col[0] for col in cursor.description]
+            results = []
+            
+            for row in cursor.fetchall():
+                if len(row) != len(columns):
+                    logger.error(f"Row length mismatch: {len(row)} columns in row, {len(columns)} expected")
+                    logger.error(f"Columns: {columns}")
+                    logger.error(f"Row: {row}")
+                    raise ValueError(f"Row length mismatch: {len(row)} != {len(columns)}")
+                row_dict = dict(zip(columns, row))
+                results.append(row_dict)
+        except Exception as e:
+            logger.error(f"Error processing query results: {e}")
+            raise
         
-        for row in cursor.fetchall():
-            row_dict = dict(zip(columns, row))
-            results.append(row_dict)
+        # Фильтруем результаты по рабочим дням для круглосуточных графиков
+        # PostgreSQL DOW: 0=воскресенье, 1=понедельник, ..., 6=суббота
+        # Python weekday (в days_of_week): 0=понедельник, 6=воскресенье
+        # Конвертация: python_weekday = (postgres_dow + 6) % 7
+        filtered_results = []
+        for result in results:
+            if result.get('schedule_type') == 'round_the_clock':
+                schedule_days_of_week = result.get('schedule_days_of_week')
+                day_of_week = result.get('day_of_week')
+                
+                # Если days_of_week не задан или пуст - все дни рабочие
+                if not schedule_days_of_week or schedule_days_of_week == [] or schedule_days_of_week == '[]' or schedule_days_of_week == 'null':
+                    filtered_results.append(result)
+                    continue
+                
+                # Если day_of_week не задан - пропускаем
+                if day_of_week is None:
+                    filtered_results.append(result)
+                    continue
+                
+                # Конвертируем PostgreSQL DOW в Python weekday
+                python_weekday = (int(day_of_week) + 6) % 7
+                
+                # Проверяем, входит ли день недели в рабочие дни
+                if isinstance(schedule_days_of_week, list):
+                    if python_weekday in schedule_days_of_week:
+                        filtered_results.append(result)
+                elif isinstance(schedule_days_of_week, str):
+                    try:
+                        import json
+                        days_list = json.loads(schedule_days_of_week)
+                        if isinstance(days_list, list) and python_weekday in days_list:
+                            filtered_results.append(result)
+                    except:
+                        # Если не удалось распарсить, считаем что день рабочий
+                        filtered_results.append(result)
+                else:
+                    # Если формат неизвестен, считаем что день рабочий
+                    filtered_results.append(result)
+            else:
+                # Для не круглосуточных графиков оставляем как есть
+                filtered_results.append(result)
         
-        return results, start_date_obj, end_date_obj
+        return filtered_results, start_date_obj, end_date_obj
 

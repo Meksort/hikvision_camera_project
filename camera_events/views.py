@@ -1206,7 +1206,7 @@ class CameraEventViewSet(viewsets.ModelViewSet):
             
             # ВАЖНО: для круглосуточных графиков ИСПОЛЬЗУЕМ значения,
             # уже рассчитанные в SQL (first_entry_raw / last_exit_raw),
-            # чтобы сохранить логику окна 07:00–11:00 и правильного выхода.
+            # чтобы сохранить логику окна 07:00–10:00 и правильного выхода.
             if schedule_type == 'round_the_clock':
                 entry_time = first_entry_raw
                 exit_time = last_exit_raw
