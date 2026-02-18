@@ -36,3 +36,5 @@ class DepartmentViewSet(viewsets.ReadOnlyModelViewSet):
 
 
 
+
+

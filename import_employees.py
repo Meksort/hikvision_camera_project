@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# -*- coding: utf-8 -*-
 """
 Скрипт для импорта сотрудников из Excel файла.
 Использование: python import_employees.py <путь_к_excel_файлу>
@@ -6,6 +7,17 @@
 import os
 import sys
 import django
+
+# Настройка кодировки для Windows консоли
+if sys.platform == 'win32':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8')
+    except AttributeError:
+        # Для старых версий Python
+        import codecs
+        sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, 'strict')
+        sys.stderr = codecs.getwriter('utf-8')(sys.stderr.buffer, 'strict')
 
 # Настройка Django окружения
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'hikvision_project.settings')
@@ -50,14 +62,14 @@ def main():
         if results['errors']:
             print(f"\nОшибки ({len(results['errors'])}):")
             for error in results['errors']:
-                print(f"  ⚠ {error}")
+                print(f"  [WARNING] {error}")
         else:
-            print("\n✓ Ошибок не обнаружено!")
+            print("\n[OK] Ошибок не обнаружено!")
         
         print(f"{'='*50}\n")
             
     except Exception as e:
-        print(f"\n❌ Критическая ошибка при импорте: {str(e)}")
+        print(f"\n[ERROR] Критическая ошибка при импорте: {str(e)}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
@@ -65,6 +77,7 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
 
 

@@ -55,7 +55,7 @@ from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl import utils
 from io import BytesIO
 
-from .models import CameraEvent, EntryExit, Employee, Department
+from .models import CameraEvent, EntryExit, Employee, Department, EmployeeAttendanceStats
 from .serializers import CameraEventSerializer, EntryExitSerializer, DepartmentSerializer
 from .schedule_matcher import ScheduleMatcher
 from .sql_reports import generate_round_the_clock_report_sql
@@ -459,17 +459,6 @@ class CameraEventViewSet(viewsets.ModelViewSet):
         - multipart/form-data (с event_log и Picture)
         - application/json
         """
-        # Логирование входящего запроса от камеры
-        client_ip = request.META.get('REMOTE_ADDR', 'unknown')
-        print(f"\n{'='*60}")
-        print(f"📹 ПОЛУЧЕНО СОБЫТИЕ ОТ КАМЕРЫ")
-        print(f"{'='*60}")
-        print(f"IP адрес камеры: {client_ip}")
-        print(f"Время получения: {timezone.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"Content-Type: {request.content_type}")
-        print(f"Method: {request.method}")
-        logger.info(f"📹 Получено событие от камеры IP: {client_ip}, Content-Type: {request.content_type}")
-        
         try:
             # Определяем тип контента
             content_type = request.content_type or ""
@@ -919,7 +908,6 @@ class CameraEventViewSet(viewsets.ModelViewSet):
                 
                 # Определяем тип события для логирования
                 event_type_str = "N/A"
-                employee_name_display = employee_name if 'employee_name' in locals() and employee_name else "N/A"
                 try:
                     # Пробуем получить тип события из access_event, если он доступен
                     if 'access_event' in locals() and isinstance(access_event, dict):
@@ -932,20 +920,7 @@ class CameraEventViewSet(viewsets.ModelViewSet):
                 except:
                     pass
                 
-                # Логирование успешного сохранения события
-                print(f"✅ СОБЫТИЕ СОХРАНЕНО:")
-                print(f"   ID сотрудника: {hikvision_id or 'N/A'}")
-                print(f"   Имя: {employee_name_display}")
-                print(f"   Устройство: {device_name or 'N/A'}")
-                print(f"   Время события: {event_time_parsed.strftime('%Y-%m-%d %H:%M:%S') if event_time_parsed else 'N/A'}")
-                print(f"   Тип события: {event_type_str}")
-                print(f"   CameraEvent ID: {camera_event.id}")
-                print(f"{'='*60}\n")
-                
-                logger.info(f"✅ Событие сохранено: ID={hikvision_id}, Имя={employee_name_display}, Устройство={device_name}, Время={event_time_parsed}, CameraEvent ID={camera_event.id}")
-                
             except Exception as e:
-                print(f"❌ ОШИБКА при сохранении события: {e}")
                 logger.error(f"Error creating CameraEvent: {e}", exc_info=True)
                 logger.error(f"Event data: hikvision_id={hikvision_id}, device_name={device_name}, event_time={event_time_parsed}")
                 return HttpResponse("OK", status=200)
@@ -1206,7 +1181,7 @@ class CameraEventViewSet(viewsets.ModelViewSet):
             
             # ВАЖНО: для круглосуточных графиков ИСПОЛЬЗУЕМ значения,
             # уже рассчитанные в SQL (first_entry_raw / last_exit_raw),
-            # чтобы сохранить логику окна 07:00–10:00 и правильного выхода.
+            # чтобы сохранить логику окна 07:00–11:00 и правильного выхода.
             if schedule_type == 'round_the_clock':
                 entry_time = first_entry_raw
                 exit_time = last_exit_raw
@@ -2758,6 +2733,226 @@ class AttendanceStatsViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = Employee.objects.none()  # Не используется для стандартных операций
     permission_classes = [AllowAny]
     
+    def list(self, request, *args, **kwargs):
+        """
+        Возвращает статистику посещаемости с KPI и данными по сотрудникам.
+        
+        Параметры:
+        - start_date - начальная дата (формат: YYYY-MM-DD)
+        - end_date - конечная дата (формат: YYYY-MM-DD)
+        - department - фильтр по отделу (можно указать несколько раз)
+        """
+        from django.db.models import Sum, Count, Q, F
+        from io import BytesIO
+        
+        start_date_str = request.query_params.get("start_date")
+        end_date_str = request.query_params.get("end_date")
+        department_ids = request.query_params.getlist("department")
+        
+        # Парсим даты
+        start_date_obj = None
+        end_date_obj = None
+        
+        if start_date_str:
+            try:
+                start_date_obj = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+            except ValueError:
+                pass
+        
+        if end_date_str:
+            try:
+                end_date_obj = datetime.strptime(end_date_str, "%Y-%m-%d").date()
+            except ValueError:
+                pass
+        
+        # По умолчанию: сегодня
+        if not start_date_obj:
+            start_date_obj = timezone.now().date()
+        if not end_date_obj:
+            end_date_obj = timezone.now().date()
+        
+        # Конвертируем в datetime для фильтрации
+        start_datetime = timezone.make_aware(datetime.combine(start_date_obj, time.min))
+        end_datetime = timezone.make_aware(datetime.combine(end_date_obj, time.max))
+        
+        # Получаем исключаемые ID
+        excluded_hikvision_ids = get_excluded_hikvision_ids()
+        
+        # Фильтр по отделам
+        department_filter = Q()
+        if department_ids:
+            all_department_ids = []
+            for dept_id in department_ids:
+                try:
+                    dept_id_int = int(dept_id)
+                    dept = Department.objects.filter(id=dept_id_int).first()
+                    if dept:
+                        # Функция для получения всех дочерних подразделений
+                        def get_all_children(dept_obj):
+                            children = [dept_obj.id]
+                            for child in dept_obj.children.all():
+                                children.extend(get_all_children(child))
+                            return children
+                        all_department_ids.extend(get_all_children(dept))
+                except (ValueError, TypeError):
+                    continue
+            if all_department_ids:
+                department_filter = Q(department_id__in=all_department_ids)
+        
+        # Получаем сотрудников
+        employees_query = Employee.objects.exclude(
+            hikvision_id__in=excluded_hikvision_ids
+        ).filter(
+            hikvision_id__isnull=False
+        )
+        
+        if department_filter:
+            employees_query = employees_query.filter(department_filter)
+        
+        employees = employees_query.select_related('department').prefetch_related('work_schedules', 'attendance_stats').distinct()
+        
+        # Вычисляем общие KPI
+        total_worked_seconds = 0
+        total_productive_seconds = 0
+        total_idle_seconds = 0
+        total_distraction_seconds = 0
+        
+        employees_data = []
+        
+        for employee in employees:
+            # Получаем записи входов/выходов для сотрудника за период
+            entry_exits = EntryExit.objects.filter(
+                hikvision_id=employee.hikvision_id,
+                entry_time__gte=start_datetime,
+                entry_time__lte=end_datetime,
+                exit_time__isnull=False
+            )
+            
+            # Считаем общее рабочее время
+            worked_seconds = entry_exits.aggregate(
+                total=Sum('work_duration_seconds')
+            )['total'] or 0
+            
+            # Временно используем упрощенную логику для продуктивности/простоя/отвлечений
+            # TODO: Заменить на реальные данные из системы мониторинга
+            productive_seconds = int(worked_seconds * 0.75)  # 75% продуктивности
+            idle_seconds = int(worked_seconds * 0.15)  # 15% простоя
+            distraction_seconds = int(worked_seconds * 0.10)  # 10% отвлечений
+            
+            # Получаем статистику опозданий и ранних уходов
+            late_count = 0
+            early_leave_count = 0
+            
+            # Получаем из EmployeeAttendanceStats
+            try:
+                stats = employee.attendance_stats
+                # Берем общее количество (в реальной системе нужно фильтровать по датам)
+                late_count = stats.late_count if stats else 0
+                early_leave_count = stats.early_leave_count if stats else 0
+            except EmployeeAttendanceStats.DoesNotExist:
+                pass
+            
+            # Считаем опоздания и ранние уходы в минутах (упрощенно)
+            late_minutes = late_count * 15  # Среднее опоздание 15 минут
+            early_leave_minutes = early_leave_count * 30  # Средний ранний уход 30 минут
+            
+            # Инциденты (пока упрощенно - можно расширить)
+            incidents_count = late_count + early_leave_count
+            
+            # Получаем название отдела
+            department_name = ""
+            if employee.department:
+                full_path = employee.department.get_full_path()
+                # Убираем "АУП" из начала
+                if full_path.startswith("АУП > "):
+                    department_name = full_path[6:]
+                elif full_path.startswith("АУП"):
+                    department_name = full_path[3:].lstrip("/ > ")
+                else:
+                    department_name = full_path
+            elif employee.department_old:
+                dept_old = employee.department_old
+                if dept_old.startswith("АУП/"):
+                    department_name = dept_old[4:].replace("/", " > ")
+                elif dept_old.startswith("АУП"):
+                    department_name = dept_old[3:].lstrip("/").replace("/", " > ")
+                else:
+                    department_name = dept_old.replace("/", " > ")
+            
+            # Аватар (пока заглушка - можно добавить реальное поле)
+            avatar = f"https://ui-avatars.com/api/?name={employee.name}&background=random"
+            
+            # Проценты для прогресс-бара
+            total_time = worked_seconds if worked_seconds > 0 else 1
+            productive_percent = round((productive_seconds / total_time) * 100, 1)
+            idle_percent = round((idle_seconds / total_time) * 100, 1)
+            distraction_percent = round((distraction_seconds / total_time) * 100, 1)
+            
+            employees_data.append({
+                "id": employee.id,
+                "name": employee.name,
+                "avatar": avatar,
+                "department": department_name,
+                "position": employee.position or "",
+                "stats": {
+                    "productivePercent": productive_percent,
+                    "distractionPercent": distraction_percent,
+                    "idlePercent": idle_percent,
+                },
+                "lateMinutes": late_minutes,
+                "earlyLeaveMinutes": early_leave_minutes,
+                "incidentsCount": incidents_count,
+                "workedSeconds": worked_seconds,
+            })
+            
+            # Суммируем для общих KPI
+            total_worked_seconds += worked_seconds
+            total_productive_seconds += productive_seconds
+            total_idle_seconds += idle_seconds
+            total_distraction_seconds += distraction_seconds
+        
+        # Вычисляем общие проценты KPI
+        total_time = total_worked_seconds if total_worked_seconds > 0 else 1
+        
+        def format_time(seconds):
+            """Форматирует секунды в 'Xч Ym'."""
+            hours = seconds // 3600
+            minutes = (seconds % 3600) // 60
+            return f"{hours}ч {minutes}м"
+        
+        def format_percent(seconds, total):
+            """Вычисляет процент."""
+            if total == 0:
+                return 0.0
+            return round((seconds / total) * 100, 1)
+        
+        # Формируем ответ
+        response_data = {
+            "kpi": {
+                "workedPercent": format_percent(total_worked_seconds, total_time),
+                "workedTime": format_time(total_worked_seconds),
+                "workedSeconds": total_worked_seconds,
+                "productivePercent": format_percent(total_productive_seconds, total_time),
+                "productiveTime": format_time(total_productive_seconds),
+                "productiveSeconds": total_productive_seconds,
+                "idlePercent": format_percent(total_idle_seconds, total_time),
+                "idleTime": format_time(total_idle_seconds),
+                "idleSeconds": total_idle_seconds,
+                "distractionPercent": format_percent(total_distraction_seconds, total_time),
+                "distractionTime": format_time(total_distraction_seconds),
+                "distractionSeconds": total_distraction_seconds,
+                "trend": {
+                    "worked": 0,  # TODO: Добавить расчет тренда
+                    "productive": 0,
+                    "idle": 0,
+                    "distraction": 0,
+                }
+            },
+            "employees": employees_data
+        }
+        
+        return Response(response_data)
+    
     @action(detail=False, methods=["get"], url_path="export-excel")
     def export_excel(self, request):
         """
@@ -3458,186 +3653,6 @@ class AttendanceStatsViewSet(viewsets.ReadOnlyModelViewSet):
                 "status": "error",
                 "message": str(e)
             }, status=500)
-class AttendanceStatsViewSet(viewsets.ReadOnlyModelViewSet):
-    """
-    ViewSet для экспорта статистики посещаемости по подразделениям.
-    """
-    queryset = Employee.objects.none()  # Не используется для стандартных операций
-    permission_classes = [AllowAny]
-    
-    @action(detail=False, methods=["get"], url_path="export-excel")
-    def export_excel(self, request):
-        """
-        Экспорт статистики посещаемости по подразделениям в Excel.
-        Фильтрует сотрудников по department_id (может быть несколько) и экспортирует их данные.
-        
-        Параметры:
-        - department_id - ID подразделения (можно указать несколько раз)
-        - start_date - начальная дата (формат: YYYY-MM-DD)
-        - end_date - конечная дата (формат: YYYY-MM-DD)
-        """
-        # Получаем параметры
-        department_ids = request.query_params.getlist("department_id")
-        start_date_str = request.query_params.get("start_date")
-        end_date_str = request.query_params.get("end_date")
-        
-        # Валидация
-        if not department_ids:
-            wb = openpyxl.Workbook()
-            ws = wb.active
-            ws.title = "Ошибка"
-            ws.append(["Не указаны ID подразделений. Используйте параметр department_id."])
-            output = BytesIO()
-            wb.save(output)
-            output.seek(0)
-            response = FileResponse(
-                output,
-                content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-            )
-            response['Content-Disposition'] = f'attachment; filename="error.xlsx"'
-            return response
-        
-        return self._export_excel_by_department_ids(department_ids, start_date_str, end_date_str)
-    
-    def _export_excel_by_department_ids(self, department_ids, start_date_str, end_date_str):
-        """
-        Экспорт данных по ID подразделений с использованием SQL запросов.
-        """
-        from .sql_reports import generate_comprehensive_attendance_report_sql
-        from .utils import get_excluded_hikvision_ids
-        from django.db.models import Q
-        
-        # Получаем исключаемые ID
-        excluded_hikvision_ids = get_excluded_hikvision_ids()
-        
-        # Функция для получения всех дочерних подразделений
-        def get_all_children(dept_obj):
-            children = [dept_obj.id]
-            for child in dept_obj.children.all():
-                children.extend(get_all_children(child))
-            return children
-        
-        # Собираем все ID подразделений (включая дочерние)
-        all_department_ids = []
-        for dept_id in department_ids:
-            try:
-                dept_id_int = int(dept_id)
-                dept = Department.objects.filter(id=dept_id_int).first()
-                if dept:
-                    all_department_ids.extend(get_all_children(dept))
-            except (ValueError, TypeError):
-                continue
-        
-        # Убираем дубликаты
-        all_department_ids = list(set(all_department_ids))
-        
-        if not all_department_ids:
-            # Если не найдено подразделений, возвращаем пустой Excel файл
-            wb = openpyxl.Workbook()
-            ws = wb.active
-            ws.title = "Нет данных"
-            ws.append(["Не найдено подразделений по указанным ID"])
-            output = BytesIO()
-            wb.save(output)
-            output.seek(0)
-            response = FileResponse(
-                output,
-                content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-            )
-            response['Content-Disposition'] = f'attachment; filename="no_data.xlsx"'
-            return response
-        
-        # Ищем сотрудников по подразделениям
-        employees_query = Employee.objects.exclude(
-            hikvision_id__in=excluded_hikvision_ids
-        ).filter(
-            hikvision_id__isnull=False,
-            department_id__in=all_department_ids
-        )
-        
-        employees_to_export = list(
-            employees_query.select_related('department').prefetch_related('work_schedules').distinct()
-        )
-        
-        if not employees_to_export:
-            # Если не найдено сотрудников, возвращаем пустой Excel файл
-            wb = openpyxl.Workbook()
-            ws = wb.active
-            ws.title = "Нет данных"
-            ws.append(["Не найдено сотрудников в указанных подразделениях"])
-            output = BytesIO()
-            wb.save(output)
-            output.seek(0)
-            response = FileResponse(
-                output,
-                content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-            )
-            response['Content-Disposition'] = f'attachment; filename="no_data.xlsx"'
-            return response
-        
-        # Создаем Excel файл
-        wb = openpyxl.Workbook()
-        # Удаляем дефолтный лист
-        if wb.worksheets:
-            wb.remove(wb.worksheets[0])
-        
-        # Для каждого сотрудника создаем отдельный лист
-        for employee in employees_to_export:
-            emp_hikvision_id = employee.hikvision_id
-            
-            # Получаем данные для этого сотрудника
-            results, start_date_obj, end_date_obj = generate_comprehensive_attendance_report_sql(
-                hikvision_id=emp_hikvision_id,
-                start_date=start_date_str,
-                end_date=end_date_str,
-                device_name=None,
-                excluded_hikvision_ids=excluded_hikvision_ids
-            )
-            
-            # Создаем лист для сотрудника
-            # Ограничиваем длину имени листа (Excel ограничение - 31 символ)
-            sheet_name = (employee.name or f"ID_{emp_hikvision_id}")[:31]
-            ws = wb.create_sheet(title=sheet_name)
-            
-            # Используем метод из EntryExitViewSet для заполнения листа
-            # Создаем временный экземпляр для вызова метода
-            entry_exit_viewset = EntryExitViewSet()
-            entry_exit_viewset._fill_employee_sheet(ws, employee, results, start_date_obj, end_date_obj)
-        
-        # Если нет ни одного листа, создаем пустой
-        if len(wb.worksheets) == 0:
-            ws = wb.create_sheet(title="Нет данных")
-            ws.append(["Не найдено данных"])
-        
-        # Сохраняем файл
-        output = BytesIO()
-        wb.save(output)
-        output.seek(0)
-        
-        # Генерируем имя файла
-        if len(employees_to_export) == 1:
-            emp = employees_to_export[0]
-            emp_name = re.sub(r'[<>:"/\\|?*]', '_', emp.name or f"ID_{emp.hikvision_id}")
-            emp_name = emp_name.replace(' ', '_')
-            emp_name = re.sub(r'_+', '_', emp_name)
-            if start_date_str and end_date_str:
-                start_date_obj = datetime.strptime(start_date_str, "%Y-%m-%d").date()
-                end_date_obj = datetime.strptime(end_date_str, "%Y-%m-%d").date()
-                start_date_str_formatted = start_date_obj.strftime('%d-%m-%Y')
-                end_date_str_formatted = end_date_obj.strftime('%d-%m-%Y')
-                filename = f"{emp_name}_с_{start_date_str_formatted}_по_{end_date_str_formatted}.xlsx"
-            else:
-                filename = f"{emp_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-        else:
-            filename = f"отчет_по_подразделениям_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-        
-        response = FileResponse(
-            output,
-            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-        )
-        from urllib.parse import quote
-        response['Content-Disposition'] = f'attachment; filename*=UTF-8\'\'{quote(filename)}'
-        return response
 
 
 # DepartmentViewSet вынесен в viewsets/department.py

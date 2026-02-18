@@ -33,11 +33,13 @@ INSTALLED_APPS = [
     "django.contrib.messages",
     "django.contrib.staticfiles",
     "rest_framework",
+    "corsheaders",  # Для работы с React frontend
     "camera_events.apps.CameraEventsConfig",  # Наше приложение для камер с сигналами
 ]
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
+    "corsheaders.middleware.CorsMiddleware",  # CORS middleware должен быть как можно выше
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -114,6 +116,16 @@ REST_FRAMEWORK = {
         "rest_framework.permissions.AllowAny",  # Камеры не используют аутентификацию
     ],
 }
+
+# CORS настройки для работы с React frontend
+CORS_ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+
+# Разрешаем все origins в режиме разработки (для упрощения)
+# В продакшене это должно быть ограничено конкретными доменами
+CORS_ALLOW_ALL_ORIGINS = DEBUG
 
 # Логирование
 LOGGING = {

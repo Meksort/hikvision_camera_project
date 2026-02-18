@@ -27,10 +27,20 @@ IP адрес сервера: 192.168.1.129
 Пароль: admin123
 
 API:
-- События: http://localhost:8000/api/camera-events/ (или http://192.168.1.129:8000/api/camera-events/)
-- Входы/выходы: http://localhost:8000/api/entries-exits/
-- Экспорт Excel: http://localhost:8000/api/entries-exits/export-excel/
-- Статистика: http://localhost:8000/api/attendance-stats/
+- События: http://localhost:8000/api/v1/camera-events/ (или http://192.168.1.129:8000/api/v1/camera-events/)
+- Входы/выходы: http://localhost:8000/api/v1/entries-exits/
+- Экспорт Excel: http://localhost:8000/api/v1/entries-exits/export-excel/
+- Статистика посещаемости: http://localhost:8000/api/v1/attendance-stats/
+- Отделы: http://localhost:8000/api/v1/departments/
+
+FRONTEND (React + TypeScript):
+1. Перейдите в папку frontend: cd frontend
+2. Установите зависимости: npm install
+3. Запустите dev сервер: npm start
+4. Откройте в браузере: http://localhost:3000
+
+Frontend подключается к Django API автоматически (настроен proxy в package.json).
+Для продакшена соберите frontend: cd frontend && npm run build
 
 Настройка камер:
 URL: http://192.168.1.129:8000/api/camera-events/
